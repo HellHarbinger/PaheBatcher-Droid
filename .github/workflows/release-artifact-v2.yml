@@ -1,0 +1,925 @@
+# Signed Android release: builds, verifies and PUBLISHES release assets to a
+# GitHub Release when a pull request is merged into `main`.
+#
+# Trigger contract (unchanged):
+#   * pull_request types:[closed] + branches:[main] + job-level
+#     `if: github.event.pull_request.merged == true` on EVERY job.
+#   * A PR closed WITHOUT merging builds, signs and publishes nothing.
+#   * Every checkout pins github.event.pull_request.merge_commit_sha
+#     (fallback github.sha) - never PR-head code.
+#   * NO push trigger, NO workflow_dispatch, NO pull_request_target.
+#
+# Signing contract:
+#   * Four repository secrets: PB_KEYSTORE_BASE64, PB_KEYSTORE_PASSWORD,
+#     PB_KEY_ALIAS, PB_KEY_PASSWORD. All four are validated fail-closed
+#     BEFORE the build; only secret NAMES are ever echoed and shell tracing
+#     is never enabled around secret handling.
+#   * The keystore is decoded into RUNNER_TEMP (umask 077, chmod 600),
+#     validated with keytool -list, and passed to Gradle as
+#     PB_KEYSTORE_PATH: ${{ runner.temp }}/pb-release.keystore - a literal
+#     path, never read back from $GITHUB_ENV.
+#   * Keystore cleanup is unconditional (`if: always()`), including after
+#     failed builds. The keystore is never uploaded, cached or published.
+#   * Gradle success alone is never trusted: signatures are re-verified with
+#     apksigner (APKs) and jarsigner/keytool (AAB) after the build.
+#
+# Fingerprint extraction (bug fixed):
+#   * `keytool -printcert -jarfile` on the JDK 25 runner labels the
+#     certificate fingerprint `SHA256:` (no dash) and INDENTS it. The
+#     previous anchored `awk '/^SHA-256:/'` therefore matched nothing,
+#     yielding an empty digest and a guaranteed false failure.
+#   * Both jobs now match `SHA-256:` AND `SHA256:` at any indent/case,
+#     normalise to bare lowercase hex, and VALIDATE the result as exactly
+#     64 hex characters before any comparison. An empty or malformed
+#     extraction fails loudly with its own message rather than comparing
+#     "" against a real digest.
+#
+# Job structure:
+#   * THREE independent verification jobs (testDebugUnitTest,
+#     testReleaseUnitTest, lintDebug) gate BOTH build jobs, so each check is
+#     a separate status and can be re-run on its own.
+#   * build-apks and build-aab depend ONLY on those three gates, so the two
+#     builds run IN PARALLEL - a release build takes the longer of the two
+#     builds, not their sum. Each build validates its OWN signer
+#     fingerprint as 64-hex; the single APK <-> AAB signer comparison
+#     happens in publish, the one place that holds BOTH digests and the
+#     last gate before release creation.
+#   * publish `needs:` ALL five jobs, so an AAB failure blocks the release -
+#     there is deliberately no APK-only publish path.
+#   * A separate `cleanup` job (`if: always() && merged`, needs: EVERY other
+#     job) is the ONE owner of temporary-storage deletion. It runs after
+#     publish finishes - succeeded, failed or skipped - and holds exactly
+#     one permission: actions: write.
+#
+# Temporary storage (what exists, and who deletes it):
+#   * TWO different things consume Actions cache storage here, and only
+#     one of them is release-temporary:
+#       1. Handoff caches: pb-release-{apks,aab}-<run_id>-<run_attempt>,
+#          written with actions/cache/save in the build jobs and read back
+#          with actions/cache/restore in publish, so the verified binaries
+#          move between jobs. actions/upload-artifact and
+#          actions/download-artifact are NOT used anywhere. These are run-
+#          scoped TEMPORARY storage and are deleted by the cleanup job.
+#       2. Gradle dependency cache: managed by gradle/actions/setup-gradle,
+#          a SEPARATE reusable cache keyed on Gradle/dependency state. The
+#          handoff cleanup does NOT delete it (deleting the two handoff
+#          keys removes only the handoff). Per setup-gradle's own docs it
+#          only WRITES from the default branch, so these pull_request runs
+#          read it but never write it; it is deliberately retained for
+#          build speed and outlives the release by design.
+#   * Cleanup ownership: the cleanup job is the ONLY place that deletes
+#     caches. Build jobs hold NO write permission and publish holds only
+#     contents: write, so nothing in the build/publish path can race with
+#     a restore or fail for lack of deletion rights; a failed or skipped
+#     publish still ends with zero orphaned handoff storage because cleanup
+#     needs: publish + always(). Deletion is idempotent: a missing key is
+#     reported as a warning, never as an error.
+#   * Note: GitHub Actions minutes AND artifact/cache storage are FREE for
+#     public repositories (docs.github.com/billing). This cleanup is applied
+#     as hygiene and to stay correct if the repository is ever transferred
+#     private, where plan storage quotas apply.
+#
+# Publication:
+#   * publish holds exactly `contents: write` (create the release) and the
+#     cleanup job exactly `actions: write` (delete handoff caches); every
+#     other job runs read-only (workflow-level contents: read).
+#   * Publication is SERIALIZED per repository by a job-level concurrency
+#     group (release-publish-<repo>, cancel-in-progress: false). The
+#     workflow-level group is keyed on the PR number and cannot stop two
+#     DIFFERENT merged PRs racing for the same tag; with this group the
+#     second publish queues, and the preflight tag/release probe makes it
+#     fail safely rather than overwrite the first release.
+#   * Authenticated with the built-in GITHUB_TOKEN via GH_TOKEN - no PAT.
+#   * Tag v<versionName>, target = the merged commit. If the tag OR the
+#     release already exists the job FAILS SAFELY: no overwrite, no moving a
+#     tag, no replacing existing assets.
+#   * Published assets: the 2 APKs, the AAB, SHA256SUMS.txt,
+#     build-metadata.json. Never the keystore, .investigation/, .scratch/
+#     or local configuration.
+
+name: Signed Android Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Three INDEPENDENT verification gates. No job here receives a secret.
+  # Each runs the identical toolchain so the checks are comparable.
+  # ---------------------------------------------------------------------------
+  debug-unit-tests:
+    name: Debug unit tests
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: |
+            platform-tools
+            platforms;android-37.0
+            build-tools;36.0.0
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Run debug unit tests
+        run: ./gradlew testDebugUnitTest
+
+  release-unit-tests:
+    name: Release unit tests
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: |
+            platform-tools
+            platforms;android-37.0
+            build-tools;36.0.0
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Run release unit tests
+        run: ./gradlew testReleaseUnitTest
+
+  debug-lint:
+    name: Debug lint
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: |
+            platform-tools
+            platforms;android-37.0
+            build-tools;36.0.0
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Run debug lint
+        run: ./gradlew lintDebug
+
+  # ---------------------------------------------------------------------------
+  # Build + verify the two per-ABI release APKs. One of only two jobs that
+  # see signing secrets. Exports the verified signer digest for publish to
+  # compare against the AAB's digest (the builds run in parallel).
+  # ---------------------------------------------------------------------------
+  build-apks:
+    name: Build and verify signed APKs
+    if: github.event.pull_request.merged == true
+    needs: [debug-unit-tests, release-unit-tests, debug-lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      signer_digest: ${{ steps.verify-apks.outputs.signer_digest }}
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: |
+            platform-tools
+            platforms;android-37.0
+            build-tools;36.0.0
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      # Fail-closed: all FOUR secrets validated before the build. Only names
+      # are echoed; no value is ever printed and tracing stays disabled.
+      - name: Validate signing secrets and prepare keystore
+        env:
+          KS_B64: ${{ secrets.PB_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.PB_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=""
+          [[ -n "$KS_B64" ]]    || missing="$missing PB_KEYSTORE_BASE64"
+          [[ -n "$KS_PASS" ]]   || missing="$missing PB_KEYSTORE_PASSWORD"
+          [[ -n "$KEY_ALIAS" ]] || missing="$missing PB_KEY_ALIAS"
+          [[ -n "$KEY_PASS" ]]  || missing="$missing PB_KEY_PASSWORD"
+
+          if [[ -n "$missing" ]]; then
+            echo "::error::Missing signing secret(s):$missing"
+            exit 1
+          fi
+
+          umask 077
+          KS_PATH="$RUNNER_TEMP/pb-release.keystore"
+
+          if ! printf '%s' "$KS_B64" | base64 --decode > "$KS_PATH"; then
+            echo "::error::Keystore secret is not valid Base64."
+            rm -f "$KS_PATH"
+            exit 1
+          fi
+
+          if [[ ! -s "$KS_PATH" ]]; then
+            echo "::error::Decoded keystore is empty."
+            rm -f "$KS_PATH"
+            exit 1
+          fi
+
+          chmod 600 "$KS_PATH"
+
+          if ! keytool -list \
+            -keystore "$KS_PATH" \
+            -storepass "$KS_PASS" \
+            -alias "$KEY_ALIAS" > /dev/null; then
+            echo "::error::Keystore validation failed. Check password and alias."
+            rm -f "$KS_PATH"
+            exit 1
+          fi
+
+      - name: Build signed APKs
+        env:
+          PB_KEYSTORE_PATH: ${{ runner.temp }}/pb-release.keystore
+          PB_KEYSTORE_PASSWORD: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          PB_KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+          PB_KEY_PASSWORD: ${{ secrets.PB_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease
+
+      - name: Verify APK signatures and ABI contents
+        id: verify-apks
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          APK_DIR="pahebatcher/build/outputs/apk/release"
+          hex64='^[0-9a-f]{64}$'
+
+          shopt -s nullglob
+          apks=("$APK_DIR"/*.apk)
+
+          if [[ ${#apks[@]} -ne 2 ]]; then
+            echo "::error::Expected exactly two release APKs; found ${#apks[@]}."
+            exit 1
+          fi
+
+          mkdir -p dist
+          reference_digest=""
+          seen_abis=()
+
+          for apk in "${apks[@]}"; do
+            name="$(basename "$apk")"
+
+            if [[ "$name" == *-unsigned.apk ]]; then
+              echo "::error::Unsigned APK detected: $name"
+              exit 1
+            fi
+
+            expected_abi="$(printf '%s' "$name" |
+              sed -n 's/^pahebatcher-\(.*\)-release\.apk$/\1/p')"
+
+            if [[ "$expected_abi" != "arm64-v8a" &&
+                  "$expected_abi" != "x86_64" ]]; then
+              echo "::error::Unexpected APK filename: $name"
+              exit 1
+            fi
+
+            cert="$("$BT/apksigner" verify --print-certs "$apk")"
+            digest="$(printf '%s\n' "$cert" |
+              awk '/Signer #1 certificate SHA-256 digest/ {print $NF; exit}' |
+              tr -d ':' | tr '[:upper:]' '[:lower:]')"
+
+            # Validate as a real fingerprint, not merely non-empty.
+            if [[ -z "$digest" ]] || ! printf '%s' "$digest" | grep -Eq "$hex64"; then
+              echo "::error::$name: apksigner reported no valid 64-hex signer certificate digest."
+              exit 1
+            fi
+
+            if [[ -z "$reference_digest" ]]; then
+              reference_digest="$digest"
+            elif [[ "$digest" != "$reference_digest" ]]; then
+              echo "::error::APK signer certificates do not match."
+              exit 1
+            fi
+
+            packaged_abis="$(unzip -Z1 "$apk" |
+              sed -n 's#^lib/\([^/]*\)/.*#\1#p' | sort -u)"
+
+            if [[ "$packaged_abis" != "$expected_abi" ]]; then
+              echo "::error::$name contains unexpected native ABIs: $packaged_abis"
+              exit 1
+            fi
+
+            seen_abis+=("$expected_abi")
+            cp "$apk" dist/
+            echo "Verified $name (signer sha256 present, single ABI $expected_abi)"
+          done
+
+          actual_abis="$(printf '%s\n' "${seen_abis[@]}" | sort -u)"
+          expected_abis=$'arm64-v8a\nx86_64'
+
+          if [[ "$actual_abis" != "$expected_abis" ]]; then
+            echo "::error::APK ABI set is incorrect: $actual_abis"
+            exit 1
+          fi
+
+          # Checksums recorded over the verified binaries so the publish job
+          # can prove the handoff did not alter a single byte.
+          (cd dist && sha256sum ./*.apk > apk-checksums.txt)
+
+          echo "signer_digest=$reference_digest" >> "$GITHUB_OUTPUT"
+
+      # Verified binaries move to the publishing job via cache (NOT
+      # actions/upload-artifact). Keyed to this run + attempt only.
+      - name: Save verified APKs for the publishing job
+        uses: actions/cache/save@v6
+        with:
+          path: dist
+          key: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Unconditional: the keystore is deleted even when any earlier step
+      # fails. Nothing here is uploaded or cached.
+      - name: Remove temporary keystore
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/pb-release.keystore"
+
+  # ---------------------------------------------------------------------------
+  # Build + verify the AAB. Depends ONLY on the three verification gates, so
+  # it runs IN PARALLEL with build-apks (total build time = the longer of
+  # the two, not their sum). It validates its OWN signer fingerprint as
+  # 64-hex; the APK <-> AAB comparison happens in publish, which receives
+  # both digests.
+  # ---------------------------------------------------------------------------
+  build-aab:
+    name: Build and verify signed AAB
+    if: github.event.pull_request.merged == true
+    needs: [debug-unit-tests, release-unit-tests, debug-lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      signer_digest: ${{ steps.verify-aab.outputs.signer_digest }}
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: |
+            platform-tools
+            platforms;android-37.0
+            build-tools;36.0.0
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      # Fail-closed: all FOUR secrets validated before the build. Only names
+      # are echoed; no value is ever printed and tracing stays disabled.
+      - name: Validate signing secrets and prepare keystore
+        env:
+          KS_B64: ${{ secrets.PB_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.PB_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=""
+          [[ -n "$KS_B64" ]]    || missing="$missing PB_KEYSTORE_BASE64"
+          [[ -n "$KS_PASS" ]]   || missing="$missing PB_KEYSTORE_PASSWORD"
+          [[ -n "$KEY_ALIAS" ]] || missing="$missing PB_KEY_ALIAS"
+          [[ -n "$KEY_PASS" ]]  || missing="$missing PB_KEY_PASSWORD"
+
+          if [[ -n "$missing" ]]; then
+            echo "::error::Missing signing secret(s):$missing"
+            exit 1
+          fi
+
+          umask 077
+          KS_PATH="$RUNNER_TEMP/pb-release.keystore"
+
+          if ! printf '%s' "$KS_B64" | base64 --decode > "$KS_PATH"; then
+            echo "::error::Keystore secret is not valid Base64."
+            rm -f "$KS_PATH"
+            exit 1
+          fi
+
+          if [[ ! -s "$KS_PATH" ]]; then
+            echo "::error::Decoded keystore is empty."
+            rm -f "$KS_PATH"
+            exit 1
+          fi
+
+          chmod 600 "$KS_PATH"
+
+          if ! keytool -list \
+            -keystore "$KS_PATH" \
+            -storepass "$KS_PASS" \
+            -alias "$KEY_ALIAS" > /dev/null; then
+            echo "::error::Keystore validation failed. Check password and alias."
+            rm -f "$KS_PATH"
+            exit 1
+          fi
+
+      - name: Build signed AAB
+        env:
+          PB_KEYSTORE_PATH: ${{ runner.temp }}/pb-release.keystore
+          PB_KEYSTORE_PASSWORD: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          PB_KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+          PB_KEY_PASSWORD: ${{ secrets.PB_KEY_PASSWORD }}
+        run: ./gradlew bundleRelease
+
+      - name: Verify AAB signature, signer identity and ABI contents
+        id: verify-aab
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AAB_DIR="pahebatcher/build/outputs/bundle/release"
+          hex64='^[0-9a-f]{64}$'
+
+          shopt -s nullglob
+          aabs=("$AAB_DIR"/*.aab)
+
+          if [[ ${#aabs[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one release AAB; found ${#aabs[@]}."
+            exit 1
+          fi
+
+          aab="${aabs[0]}"
+          name="$(basename "$aab")"
+
+          # --- INTEGRITY GATE: non-strict must exit 0; exit 1 = tamper. ---
+          # Full diagnostics are always echoed (never discarded).
+          set +e
+          verify_out="$(jarsigner -verify "$aab" 2>&1)"
+          js=$?
+          set -e
+          printf '%s\n' "$verify_out"
+          if [[ $js -ne 0 ]]; then
+            echo "::error::$name: jarsigner -verify reported the AAB as NOT verified (exit ${js}) - integrity failure."
+            exit 1
+          fi
+
+          # --- Strict diagnostics are INFORMATIONAL ONLY. ---
+          # The release certificate is intentionally self-signed, so -strict
+          # exits non-zero (4 on JDK 25) for an intact jar. Displayed for
+          # visibility; never used to reject a valid self-signed release.
+          set +e
+          strict_out="$(jarsigner -verify -strict "$aab" 2>&1)"
+          js_strict=$?
+          set -e
+          printf '%s\n' "$strict_out"
+          if [[ $js_strict -ne 0 ]]; then
+            echo "NOTE: jarsigner -verify -strict exited ${js_strict}; expected for the intentionally self-signed release certificate. The non-strict integrity gate above passed (exit 0)."
+          fi
+
+          # --- Signer fingerprint (self-check; cross-job compare in publish) ---
+          # keytool prints the fingerprint label as "SHA256:" (no dash) and
+          # indented, so BOTH spellings are matched at any indent/case, and
+          # the value must be exactly 64 hex characters before it is
+          # exported as this job's signer_digest for publish to compare
+          # against the APK signer digest.
+          set +e
+          cert_dump="$(keytool -printcert -jarfile "$aab" 2>&1)"
+          kt=$?
+          set -e
+          if [[ $kt -ne 0 ]]; then
+            echo "::error::$name: keytool -printcert -jarfile failed (exit ${kt})."
+            printf '%s\n' "$cert_dump"
+            exit 1
+          fi
+
+          digest="$(printf '%s\n' "$cert_dump" |
+            sed -n 's/^[[:space:]]*SHA-\{0,1\}256:[[:space:]]*\([0-9A-Fa-f:]*\).*/\1/p' |
+            head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+
+          if [[ -z "$digest" ]] || ! printf '%s' "$digest" | grep -Eq "$hex64"; then
+            echo "::error::$name: could not extract a valid 64-hex SHA-256 signer fingerprint from keytool output."
+            printf '%s\n' "$cert_dump"
+            exit 1
+          fi
+
+          # The APK signer comparison is intentionally NOT done here: this
+          # job no longer depends on build-apks, so publish performs the
+          # single authoritative comparison of both exported digests.
+
+          # --- ABI packaging: exactly arm64-v8a + x86_64 (32-bit pruned). ---
+          aab_abis="$(unzip -Z1 "$aab" |
+            sed -n 's#^base/lib/\([^/]*\)/.*#\1#p' | sort -u)"
+          expected_abis=$'arm64-v8a\nx86_64'
+
+          if [[ "$aab_abis" != "$expected_abis" ]]; then
+            echo "::error::Unexpected native ABIs in AAB: $aab_abis"
+            exit 1
+          fi
+
+          mkdir -p dist
+          cp "$aab" dist/
+          (cd dist && sha256sum ./*.aab > aab-checksums.txt)
+
+          echo "signer_digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Verified $name (integrity OK, signer fingerprint valid 64-hex, ABIs arm64-v8a+x86_64; compared with APK signer in publish)"
+
+      # Verified AAB moves to the publishing job via cache (NOT
+      # actions/upload-artifact). Keyed to this run + attempt only.
+      - name: Save verified AAB for the publishing job
+        uses: actions/cache/save@v6
+        with:
+          path: dist
+          key: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Unconditional: the keystore is deleted even when any earlier step
+      # fails. Nothing here is uploaded or cached.
+      - name: Remove temporary keystore
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/pb-release.keystore"
+
+  # ---------------------------------------------------------------------------
+  # PUBLISH - holds exactly `contents: write`, the only job that can create
+  # a release. `needs:` lists EVERY other job, so publication is impossible
+  # unless all three gates AND both builds succeeded.
+  #
+  # Receives NO signing secret: only the built-in GITHUB_TOKEN (GH_TOKEN).
+  # It does NOT delete caches - the cleanup job owns that exclusively.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish GitHub Release
+    if: github.event.pull_request.merged == true
+    needs: [debug-unit-tests, release-unit-tests, debug-lint, build-apks, build-aab]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Serialize PUBLICATION across PRs. The workflow-level group is keyed
+    # on the PR number, so it only stops two runs of the SAME PR from
+    # overlapping - it does not stop two different merged PRs from racing to
+    # publish the same tag. This job-level group makes publish jobs queue
+    # per repository while gates and builds still run in parallel, and the
+    # tag/release preflight check then makes the second PR fail safely
+    # instead of overwriting the first release.
+    # Note: GitHub keeps only ONE pending job per group - a run queued
+    # behind a running publish can be superseded by a newer run (it shows
+    # as skipped and must be re-run manually; the preflight checks make a
+    # re-run safe because an existing tag/release is never overwritten).
+    concurrency:
+      group: release-publish-${{ github.repository }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: write   # create the release and upload assets
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      # fail-on-cache-miss: a missing handoff is a hard failure - never an
+      # empty or partial release. Both restore into dist/, whose file names
+      # are disjoint (2 APKs + 1 AAB + distinct checksum files).
+      - name: Restore verified APKs
+        uses: actions/cache/restore@v6
+        with:
+          path: dist
+          key: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+
+      - name: Restore verified AAB
+        uses: actions/cache/restore@v6
+        with:
+          path: dist
+          key: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+
+      # Re-verify the handoff byte-for-byte and the signer identity, then
+      # drop the per-job checksum files so only release assets remain.
+      - name: Verify the handoff and the signing identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f dist/apk-checksums.txt || ! -f dist/aab-checksums.txt ]]; then
+            echo "::error::Handoff checksum files are missing - refusing to publish."
+            exit 1
+          fi
+
+          if ! (cd dist && sha256sum -c apk-checksums.txt); then
+            echo "::error::APK handoff failed checksum verification."
+            exit 1
+          fi
+
+          if ! (cd dist && sha256sum -c aab-checksums.txt); then
+            echo "::error::AAB handoff failed checksum verification."
+            exit 1
+          fi
+
+          hex64='^[0-9a-f]{64}$'
+          apk_signer="$(printf '%s' '${{ needs.build-apks.outputs.signer_digest }}' |
+            tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          aab_signer="$(printf '%s' '${{ needs.build-aab.outputs.signer_digest }}' |
+            tr -d ':' | tr '[:upper:]' '[:lower:]')"
+
+          if [[ -z "$apk_signer" ]] || ! printf '%s' "$apk_signer" | grep -Eq "$hex64"; then
+            echo "::error::APK signer digest is not a valid 64-hex fingerprint."
+            exit 1
+          fi
+
+          # This is the ONE authoritative APK <-> AAB signer comparison:
+          # both builds run in parallel, so neither could compare earlier.
+          if [[ -z "$aab_signer" ]] || ! printf '%s' "$aab_signer" | grep -Eq "$hex64"; then
+            echo "::error::AAB signer digest is not a valid 64-hex fingerprint."
+            exit 1
+          fi
+
+          if [[ "$aab_signer" != "$apk_signer" ]]; then
+            echo "::error::APK and AAB signer certificates do not match - refusing to publish."
+            exit 1
+          fi
+
+          shopt -s nullglob
+          apks=(dist/*.apk)
+          aabs=(dist/*.aab)
+          if [[ ${#apks[@]} -ne 2 || ${#aabs[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly 2 APKs and 1 AAB in the handoff; got ${#apks[@]} APK(s), ${#aabs[@]} AAB(s)."
+            exit 1
+          fi
+
+          if ls dist/*-unsigned.* 2>/dev/null | grep -q .; then
+            echo "::error::Unsigned artifact reached the release payload - refusing to publish."
+            exit 1
+          fi
+
+          rm -f dist/apk-checksums.txt dist/aab-checksums.txt
+          echo "Handoff verified; signer identity matches across all binaries."
+
+      - name: Prepare release metadata and checksums
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION_NAME="$(sed -n \
+            's/.*versionName = "\([^"]*\)".*/\1/p' \
+            pahebatcher/build.gradle.kts | head -n 1)"
+
+          VERSION_CODE="$(sed -n \
+            's/.*versionCode = \([0-9][0-9]*\).*/\1/p' \
+            pahebatcher/build.gradle.kts | head -n 1)"
+
+          if [[ -z "$VERSION_NAME" || -z "$VERSION_CODE" ]]; then
+            echo "::error::Could not read versionName/versionCode from Gradle."
+            exit 1
+          fi
+
+          if [[ ! "$VERSION_NAME" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::versionName contains unsupported tag characters."
+            exit 1
+          fi
+
+          TAG="v${VERSION_NAME}"
+          TARGET="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+
+          (
+            cd dist
+            sha256sum ./*.apk ./*.aab > SHA256SUMS.txt
+          )
+
+          jq -n \
+            --arg versionName "$VERSION_NAME" \
+            --arg versionCode "$VERSION_CODE" \
+            --arg commit "$TARGET" \
+            --arg shortCommit "$SHORT_SHA" \
+            --arg builtAt "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+            '{
+              versionName: $versionName,
+              versionCode: $versionCode,
+              commit: $commit,
+              shortCommit: $shortCommit,
+              builtAtUtc: $builtAt
+            }' > dist/build-metadata.json
+
+      # Fail safely on EITHER a pre-existing tag or a pre-existing release.
+      # Never overwrite a release, never move an existing tag.
+      - name: Ensure neither tag nor release already exists
+        env:
+          TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$TAG" ]]; then
+            echo "::error::Release tag is empty - refusing to publish."
+            exit 1
+          fi
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "::error::A GitHub Release for ${TAG} already exists. Refusing to overwrite it or replace its assets."
+            exit 1
+          fi
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" > /dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists. Bump versionName before releasing."
+            exit 1
+          fi
+
+          echo "Neither ${TAG} nor its release exists - safe to publish."
+
+      - name: Create release and upload assets
+        env:
+          TAG: ${{ steps.metadata.outputs.tag }}
+          TARGET: ${{ steps.metadata.outputs.target }}
+        run: |
+          set -euo pipefail
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET" \
+            --title "PaheBatcher ${TAG}" \
+            --generate-notes \
+            dist/*.apk \
+            dist/*.aab \
+            dist/SHA256SUMS.txt \
+            dist/build-metadata.json
+
+          echo "Published ${TAG} targeting ${TARGET}"
+
+  # ---------------------------------------------------------------------------
+  # CLEANUP - the SINGLE owner of temporary-storage deletion.
+  #
+  #   * needs: publish + `if: always() && merged` => this job runs after
+  #     publish has finished whether it SUCCEEDED, FAILED or was SKIPPED
+  #     (publish is skipped whenever an upstream gate or build fails), so
+  #     no run can leave an orphaned handoff cache behind.
+  #   * needs: lists EVERY job explicitly (publish plus all five of
+  #     publish's own dependencies). Depending only on `needs: publish`
+  #     would assume GitHub defers a SKIPPED publish until its dependencies
+  #     finish, which is not documented: cleanup could otherwise start while
+  #     a still-running build saves its handoff AFTER cleanup ran. With the
+  #     full list, cleanup cannot start until every gate and both builds are
+  #     terminal. If you add a job to this workflow, add it here too.
+  #   * It runs AFTER publish, never during it, so deletion can never race
+  #     against actions/cache/restore.
+  #   * Holds exactly `actions: write` - the only job that has it. Build
+  #     jobs hold no write permission at all, and publish holds only
+  #     `contents: write`, so cache deletion is impossible anywhere else.
+  #   * No checkout, no build toolchain, no secret: only the built-in
+  #     GITHUB_TOKEN (needs actions:write for the cache DELETE API).
+  #   * Deletion is idempotent: DELETE-by-key on a key that no longer
+  #     exists is reported as a warning and never changes this job's
+  #     result, so cleanup can neither mask a real failure nor be masked
+  #     by one. GitHub's own cache eviction remains the backstop.
+  #   * Only the two run-scoped handoff keys are deleted. The reusable
+  #     Gradle dependency cache managed by setup-gradle is a different,
+  #     deliberately retained cache and is not touched here.
+  # ---------------------------------------------------------------------------
+  cleanup:
+    name: Delete temporary handoff caches
+    if: always() && github.event.pull_request.merged == true
+    needs:
+      - debug-unit-tests
+      - release-unit-tests
+      - debug-lint
+      - build-apks
+      - build-aab
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      actions: write    # delete this run's temporary handoff caches ONLY
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      # DELETE-by-key returns HTTP 200 with a JSON body whose total_count
+      # may be 0 when no entry matched, so an HTTP success ALONE must never
+      # be reported as "deleted". The body is parsed to report the actual
+      # number of matching entries; a failed request (network/auth/API) is
+      # a warning, never an error, so cleanup can neither mask a real
+      # failure nor be masked by one. jq is preinstalled on GitHub-hosted
+      # Ubuntu runners.
+      - name: Delete this run's handoff caches
+        shell: bash
+        env:
+          APKS_KEY: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
+          AAB_KEY: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -uo pipefail
+
+          for key in "$APKS_KEY" "$AAB_KEY"; do
+            if response="$(gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/caches?key=${key}" 2>&1)"; then
+              count="$(printf '%s' "$response" | jq -r '.total_count // empty')"
+
+              if [[ "$count" =~ ^[0-9]+$ ]]; then
+                echo "Cache entries deleted for ${key}: ${count}"
+              else
+                echo "::warning::Deletion request succeeded for ${key}, but its response could not be interpreted."
+              fi
+            else
+              echo "::warning::Cache deletion request failed for ${key}: ${response}"
+            fi
+          done
+
+          echo "Cleanup pass finished for run ${GITHUB_RUN_ID}."

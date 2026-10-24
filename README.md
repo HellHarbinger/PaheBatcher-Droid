@@ -394,7 +394,7 @@ installs** (different certificates).
 
 ## GitHub Actions artifacts
 
-Workflow: [`.github/workflows/release-artifacts.yml`](.github/workflows/release-artifacts.yml)
+Workflow: [`.github/workflows/release-artifacts.yml.bak`](.github/workflows/release-artifacts.yml.bak)
 
 | Aspect | Behavior |
 |---|---|
