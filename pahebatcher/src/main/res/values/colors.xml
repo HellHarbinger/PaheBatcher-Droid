@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#1B1B1F</color>
+    <!-- Phase 11 (PHASE11_ARCHITECTURE_V2 §4/§8): dark first frame. The XML window
+         theme resolves before Compose starts and cannot read the DataStore theme
+         preference, so the pre-Compose window background is the dark void color by
+         default (accepted single dark frame for LIGHT users — no second persistence
+         mechanism, §8). -->
+    <color name="window_background">#05070D</color>
+</resources>

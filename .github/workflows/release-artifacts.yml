@@ -1,0 +1,324 @@
+# Builds downloadable release APK/AAB artifacts for human review.
+#
+# Trigger contract:
+#   * Runs ONLY when a pull request targeting `main` is closed AND merged
+#     (pull_request types:[closed] + branches:[main] + job-level `if` on
+#     github.event.pull_request.merged == true).
+#   * A PR closed WITHOUT merging never reaches the build job - no signing,
+#     no build, no artifact.
+#   * The job checks out the merge commit that landed on main
+#     (github.event.pull_request.merge_commit_sha), never PR-head code.
+#   * There is NO push trigger and NO workflow_dispatch: signed artifacts are
+#     produced only by a merged PR. (workflow_dispatch existed before signing
+#     was wired in and was removed here - a manual dispatch would allow
+#     on-demand signed builds; re-add only on explicit owner authorization.)
+#
+# Signing contract:
+#   * The Gradle release signing config is env-gated and fail-closed
+#     (PB_KEYSTORE_PATH / PB_KEYSTORE_PASSWORD / PB_KEY_ALIAS / PB_KEY_PASSWORD,
+#     see signing.env.example and pahebatcher/build.gradle.kts). Unchanged.
+#   * This workflow consumes exactly four repository secrets:
+#       PB_KEYSTORE_BASE64, PB_KEYSTORE_PASSWORD, PB_KEY_ALIAS, PB_KEY_PASSWORD
+#     The keystore is reconstructed from PB_KEYSTORE_BASE64 into RUNNER_TEMP
+#     (mode 600) and PB_KEYSTORE_PATH is generated locally - never a secret.
+#   * Missing or empty secrets fail the job EARLY with the missing NAME(S)
+#     only; no value is ever printed. An incorrectly named secret therefore
+#     surfaces as "missing", never as a silent fallback.
+#   * Artifact signing is VERIFIED after the build with apksigner/jarsigner
+#     (signature validity, signer-certificate consistency across all outputs,
+#     per-ABI native-library purity) - Gradle success alone is never trusted.
+#   * The temporary keystore is deleted in an unconditional cleanup step,
+#     including after failed builds. It is never uploaded as an artifact.
+#
+# Explicitly NOT done here: no GitHub Release is created, nothing is uploaded to
+# Google Play, no push/merge is performed by this file, and only the paths listed
+# under `dist/` are uploaded (never .investigation/, .scratch/, keystores or local
+# configuration).
+
+name: Release artifacts (merged PR)
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+# Least privilege: this workflow only reads the repository it builds.
+permissions:
+  contents: read
+
+# Never cancel a run mid-upload; merge runs are kept apart per PR.
+concurrency:
+  group: release-artifacts-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build release APK + AAB
+    # A closed-but-unmerged PR fails this condition and produces no artifact.
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out the merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      # Fail fast BEFORE tests/build if any signing secret is absent or empty.
+      # Only names are echoed; values are never printed and tracing is never
+      # enabled around secret-handling steps.
+      - name: Validate signing secrets (fail-closed, names only)
+        env:
+          KS_B64: ${{ secrets.PB_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.PB_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "$KS_B64" ]    || missing="${missing} PB_KEYSTORE_BASE64"
+          [ -n "$KS_PASS" ]   || missing="${missing} PB_KEYSTORE_PASSWORD"
+          [ -n "$KEY_ALIAS" ] || missing="${missing} PB_KEY_ALIAS"
+          [ -n "$KEY_PASS" ]  || missing="${missing} PB_KEY_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing/empty signing secret(s):${missing}. All four secrets (PB_KEYSTORE_BASE64, PB_KEYSTORE_PASSWORD, PB_KEY_ALIAS, PB_KEY_PASSWORD) must be configured under exactly these names. No fallback exists and no value was printed."
+            exit 1
+          fi
+          echo "All four signing secrets are present (values not echoed)."
+
+      - name: Validate Gradle wrapper (supply-chain check)
+        uses: gradle/actions/wrapper-validation@v6
+
+      # Toolchain mirrors the repository: JDK 25 (gradle.properties /
+      # pahebatcher/build.gradle.kts jvmToolchain(25)), Gradle 9.8.2 (wrapper).
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # compileSdk 37 -> platforms;android-37.0 (verified via sdkmanager --list),
+      # build-tools 36.0.0 matches the locally used build-tools.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      # Verification gates the artifact upload: any test or lint error fails the
+      # job before packaging. Both unit-test variants exist because
+      # android.onlyEnableUnitTestForTheTestedBuildType=false (gradle.properties).
+      # No secret is provided to this step.
+      - name: Verify (JVM unit tests + lint)
+        run: ./gradlew testDebugUnitTest testReleaseUnitTest lintDebug
+
+      # Reconstruct the keystore under the runner's temp directory with
+      # restrictive permissions. The keystore path is generated here - the
+      # owner stores no runner-specific path as a secret. Base64 validity and
+      # non-emptiness are checked; password/alias are checked against the
+      # keystore itself so a wrong secret fails BEFORE the long build. Output
+      # of keytool is discarded; no key material is ever printed.
+      - name: Reconstruct release keystore (fail-closed)
+        env:
+          KS_B64: ${{ secrets.PB_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KS_PATH="${RUNNER_TEMP}/pb-release.keystore"
+          if ! printf '%s' "$KS_B64" | base64 -d > "${KS_PATH}"; then
+            echo "::error::PB_KEYSTORE_BASE64 is not valid Base64. Refusing to continue."
+            rm -f "${KS_PATH}"
+            exit 1
+          fi
+          if [ ! -s "${KS_PATH}" ]; then
+            echo "::error::PB_KEYSTORE_BASE64 decoded to an empty file. Refusing to continue."
+            rm -f "${KS_PATH}"
+            exit 1
+          fi
+          chmod 600 "${KS_PATH}"
+          if ! keytool -list -keystore "${KS_PATH}" -storepass "${KS_PASS}" -alias "${KEY_ALIAS}" > /dev/null; then
+            echo "::error::Reconstructed keystore failed validation (wrong PB_KEYSTORE_PASSWORD or PB_KEY_ALIAS, or not a keystore). No value was printed."
+            rm -f "${KS_PATH}"
+            exit 1
+          fi
+          echo "PB_RELEASE_KEYSTORE=${KS_PATH}" >> "${GITHUB_ENV}"
+          echo "Keystore reconstructed and validated (path is a runner-temp location; contents never printed)."
+
+      # Only this step receives signing secrets, and only the three value
+      # secrets - PB_KEYSTORE_BASE64 never reaches the build. The Gradle
+      # skeleton (unchanged) signs only when ALL FOUR PB_* variables are
+      # present, so a partial set fails closed inside Gradle as well.
+      - name: Build release APK + AAB (signed)
+        env:
+          PB_KEYSTORE_PATH: ${{ env.PB_RELEASE_KEYSTORE }}
+          PB_KEYSTORE_PASSWORD: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          PB_KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+          PB_KEY_PASSWORD: ${{ secrets.PB_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease bundleRelease
+
+      # Post-build artifact verification. Gradle success is NOT trusted as
+      # proof of signing: every artifact is checked with the Android/JDK
+      # signing tools, the signer certificate must be identical across all
+      # outputs, and native libraries must match the ABI packaging policy
+      # (per-ABI APKs: exactly one ABI each; AAB: arm64-v8a + x86_64 only,
+      # 32-bit dirs pruned by packaging.jniLibs.excludes). No secret is
+      # provided to this step - verification needs none.
+      - name: Verify signatures and ABI packaging
+        run: |
+          set -euo pipefail
+          BT="${ANDROID_HOME}/build-tools/36.0.0"
+          if [ ! -x "${BT}/apksigner" ]; then
+            echo "::error::apksigner not found under ${BT}"
+            exit 1
+          fi
+          APK_DIR="pahebatcher/build/outputs/apk/release"
+          AAB_DIR="pahebatcher/build/outputs/bundle/release"
+
+          # A signed AGP build never emits "-unsigned" artifacts; their
+          # presence means signing silently did not take effect.
+          if ls "${APK_DIR}"/*-unsigned.apk 2>/dev/null | grep -q .; then
+            echo "::error::unsigned APK artifact(s) present under ${APK_DIR} - signing did not take effect"
+            exit 1
+          fi
+
+          shopt -s nullglob
+          apks=("${APK_DIR}"/*.apk)
+          aabs=("${AAB_DIR}"/*.aab)
+          if [ "${#apks[@]}" -lt 1 ]; then
+            echo "::error::no release APK produced under ${APK_DIR}"
+            exit 1
+          fi
+          if [ "${#aabs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one release AAB under ${AAB_DIR}, found ${#aabs[@]}"
+            exit 1
+          fi
+
+          # --- APKs: signature validity + signer digest + ABI purity ---
+          reference_digest=""
+          for apk in "${apks[@]}"; do
+            name=$(basename "${apk}")
+            cert=$("${BT}/apksigner" verify --print-certs "${apk}")
+            digest=$(printf '%s\n' "${cert}" | awk '/Signer #1 certificate SHA-256 digest/ {print $NF}')
+            if [ -z "${digest}" ]; then
+              echo "::error::${name}: apksigner reported no signer certificate digest"
+              exit 1
+            fi
+            if [ -z "${reference_digest}" ]; then
+              reference_digest="${digest}"
+            elif [ "${digest}" != "${reference_digest}" ]; then
+              echo "::error::${name}: signer certificate differs from the other release outputs - inconsistent signing identity"
+              exit 1
+            fi
+            # Expected ABI comes from the artifact name pahebatcher-<abi>-release.apk
+            expected_abi=$(printf '%s' "${name}" | sed -n 's/^pahebatcher-\(.*\)-release\.apk$/\1/p')
+            if [ -z "${expected_abi}" ]; then
+              echo "::error::${name}: does not match the expected pahebatcher-<abi>-release.apk naming"
+              exit 1
+            fi
+            packaged_abis=$(unzip -Z1 "${apk}" | sed -n 's#^lib/\([^/]*\)/.*#\1#p' | sort -u)
+            abi_count=$(printf '%s\n' "${packaged_abis}" | grep -c . || true)
+            if [ "${abi_count}" -ne 1 ] || [ "${packaged_abis}" != "${expected_abi}" ]; then
+              echo "::error::${name}: native libs must contain exactly the '${expected_abi}' ABI, found: $(printf '%s' "${packaged_abis:-<none>}")"
+              exit 1
+            fi
+            echo "VERIFIED: ${name} signed, signer-sha256=${digest}, single ABI=${expected_abi}"
+          done
+
+          # --- AAB: JAR signature validity + same signer + ABI packaging ---
+          aab="${aabs[0]}"
+          aab_name=$(basename "${aab}")
+          # jarsigner -verify exit codes: 0 = verified, 16 = verified WITH
+          # warnings (e.g. no timestamp), anything else = not verified.
+          set +e
+          jarsigner -verify -strict "${aab}" > /dev/null 2>&1
+          js=$?
+          set -e
+          if [ "${js}" -ne 0 ] && [ "${js}" -ne 16 ]; then
+            echo "::error::${aab_name}: jarsigner -verify failed with exit ${js} (not correctly signed)"
+            exit 1
+          fi
+          aab_digest=$(keytool -printcert -jarfile "${aab}" | awk '/^SHA-256:/ {print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          apk_digest_lc=$(printf '%s' "${reference_digest}" | tr '[:upper:]' '[:lower:]')
+          if [ -z "${aab_digest}" ] || [ "${aab_digest}" != "${apk_digest_lc}" ]; then
+            echo "::error::${aab_name}: signer certificate does not match the release APKs"
+            exit 1
+          fi
+          aab_abis=$(unzip -Z1 "${aab}" | sed -n 's#^base/lib/\([^/]*\)/.*#\1#p' | sort -u)
+          expected_aab_abis=$'arm64-v8a\nx86_64'
+          if [ "${aab_abis}" != "${expected_aab_abis}" ]; then
+            echo "::error::${aab_name}: native libs must declare exactly arm64-v8a + x86_64, found: $(printf '%s' "${aab_abis:-<none>"} | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "VERIFIED: ${aab_name} signed, signer-sha256=${aab_digest}, ABIs=arm64-v8a+x86_64"
+
+      - name: Collect artifacts, checksums and build metadata
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # ABI splits produce one SIGNED APK per ABI
+          # (pahebatcher-<abi>-release.apk); collect every one, never just the
+          # first match. Defense in depth: never collect an unsigned artifact.
+          apk_count=$(ls pahebatcher/build/outputs/apk/release/*.apk 2>/dev/null | wc -l)
+          if [ "$apk_count" -lt 1 ]; then
+            echo "::error::no release APK produced under pahebatcher/build/outputs/apk/release/"
+            exit 1
+          fi
+          cp pahebatcher/build/outputs/apk/release/*.apk dist/
+          aab=$(ls pahebatcher/build/outputs/bundle/release/*.aab | head -n 1)
+          cp "$aab" dist/
+          if ls dist/*-unsigned.* 2>/dev/null | grep -q .; then
+            echo "::error::unsigned artifact reached dist/ - aborting upload"
+            exit 1
+          fi
+          (cd dist && sha256sum ./*.apk ./*.aab > SHA256SUMS.txt)
+          version_name=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' pahebatcher/build.gradle.kts | head -n 1)
+          version_code=$(sed -n 's/.*versionCode = \([0-9][0-9]*\).*/\1/p' pahebatcher/build.gradle.kts | head -n 1)
+          short_sha=$(git rev-parse --short=12 HEAD)
+          gradle_version=$(sed -n 's/.*gradle-\([0-9][0-9.]*\)-bin\.zip/\1/p' gradle/wrapper/gradle-wrapper.properties | head -n 1)
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > dist/build-metadata.json <<EOF
+          {
+            "repository": "${GITHUB_REPOSITORY}",
+            "commit": "${GITHUB_SHA}",
+            "short_commit": "${short_sha}",
+            "workflow_run_id": "${GITHUB_RUN_ID}",
+            "workflow_run_url": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}",
+            "variant": "release",
+            "signed": true,
+            "version_name": "${version_name}",
+            "version_code": "${version_code}",
+            "gradle": "${gradle_version}",
+            "jdk": "25 (temurin)",
+            "verification": "testDebugUnitTest + testReleaseUnitTest + lintDebug + apksigner/jarsigner signature and ABI checks",
+            "built_at_utc": "${built_at}"
+          }
+          EOF
+          artifact_name="PaheBatcher-release-v${version_name}-code${version_code}-${short_sha}"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_ENV"
+          for f in dist/*.apk; do
+            echo "APK=$(basename "$f") SHA256=$(sha256sum "$f" | cut -d' ' -f1)"
+          done
+          echo "AAB=$(basename "$aab") SHA256=$(sha256sum "$aab" | cut -d' ' -f1)"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.artifact_name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+      # Unconditional cleanup: the reconstructed keystore is deleted even when
+      # any earlier step fails. Never uploads anything.
+      - name: Cleanup temporary keystore
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/pb-release.keystore"
+          echo "Temporary keystore removed (if it existed)."

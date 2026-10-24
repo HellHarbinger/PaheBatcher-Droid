@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Phase 14 test harness (PHASE14_PLAN §17, AutoResumeConnectivityTest).
+
+  DEBUG BUILDS ONLY (this file lives in src/debug/res). Release builds never
+  see it: the manifest element that references it is declared in
+  src/debug/AndroidManifest.xml.
+
+  Why it exists: the on-device connectivity-severing test runs the REAL
+  DownloadWorker/OkHttp path against an in-process loopback HLS fixture
+  (http://127.0.0.1:<port>/...). With targetSdk 37 the platform default
+  denies cleartext everywhere, so without this the fixture could not be
+  reached and the auto-resume park → restore → resume path could not be
+  exercised end to end.
+
+  Scope: cleartext is opened ONLY for the loopback address. Every other
+  destination keeps the platform default (cleartext denied, HTTPS required),
+  so production CDN/Kwik traffic is unaffected.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
