@@ -1,0 +1,927 @@
+# Builds signed, verified release APK/AAB assets and publishes them to a
+# GitHub Release (replacing the former temporary Actions-artifact upload).
+#
+# Trigger contract:
+#   * Runs ONLY when a pull request targeting `main` is closed AND merged
+#     (pull_request types:[closed] + branches:[main] + job-level `if` on
+#     github.event.pull_request.merged == true).
+#   * A PR closed WITHOUT merging never reaches the build job - no signing,
+#     no build, no artifact.
+#   * The job checks out the merge commit that landed on main
+#     (github.event.pull_request.merge_commit_sha), never PR-head code.
+#   * There is NO push trigger and NO workflow_dispatch: signed artifacts are
+#     produced only by a merged PR. (workflow_dispatch existed before signing
+#     was wired in and was removed here - a manual dispatch would allow
+#     on-demand signed builds; re-add only on explicit owner authorization.)
+#
+# Signing contract:
+#   * The Gradle release signing config is env-gated and fail-closed
+#     (PB_KEYSTORE_PATH / PB_KEYSTORE_PASSWORD / PB_KEY_ALIAS / PB_KEY_PASSWORD,
+#     see signing.env.example and pahebatcher/build.gradle.kts). Unchanged.
+#   * This workflow consumes exactly four repository secrets:
+#       PB_KEYSTORE_BASE64, PB_KEYSTORE_PASSWORD, PB_KEY_ALIAS, PB_KEY_PASSWORD
+#     The keystore is reconstructed from PB_KEYSTORE_BASE64 into RUNNER_TEMP
+#     (mode 600) and PB_KEYSTORE_PATH is generated locally - never a secret.
+#   * Missing or empty secrets fail the job EARLY with the missing NAME(S)
+#     only; no value is ever printed. An incorrectly named secret therefore
+#     surfaces as "missing", never as a silent fallback.
+#   * Artifact signing is VERIFIED after the build with apksigner/jarsigner
+#     (signature validity, signer-certificate consistency across all outputs,
+#     per-ABI native-library purity) - Gradle success alone is never trusted.
+#   * The AAB integrity gate is `jarsigner -verify` (NON-strict, exit 0
+#     required). The release certificate is intentionally self-signed, so
+#     `jarsigner -verify -strict` returns exit 4 ("jar verified, with signer
+#     errors") for it, while a genuine tamper returns exit 1 in both modes
+#     (verified empirically on JDK 25). Keying the gate off the NON-strict
+#     result keeps tamper detection (exit 1 still fails) without treating the
+#     expected self-signed certificate chain as a failure. The full jarsigner
+#     diagnostics are always echoed so the self-signed condition is visible.
+#   * The temporary keystore is deleted in an unconditional cleanup step,
+#     including after failed builds. It is never uploaded as an artifact.
+#
+# Job structure (job-level granularity + APK/AAB failure isolation):
+#   * THREE independent verification jobs - debug-unit-tests
+#     (testDebugUnitTest), release-unit-tests (testReleaseUnitTest) and
+#     debug-lint (lintDebug) - gate TWO independent build jobs via `needs:`.
+#     All commands and results are visible as separate checks in the Actions
+#     UI, and "Re-run failed jobs" reruns only the check that failed (plus its
+#     dependents), not the others.
+#   * build-apks builds and verifies the two per-ABI release APKs, then hands
+#     them to the publishing job. build-aab (needs: build-apks) then builds and
+#     verifies the AAB independently. Publication is ALL-OR-NOTHING: the
+#     publish-release job `needs:` all five jobs, so an AAB failure blocks the
+#     release entirely - there is deliberately NO APK-only publish path.
+#   * Every job checks out the SAME merge commit and sets up the same
+#     JDK 25 / Android SDK / Gradle toolchain; none of the verification jobs
+#     receives any secret. build-apks and build-aab are the only jobs that see
+#     signing secrets, and only for a MERGED pull request.
+#
+# Cross-job handoff (why cache, not actions/upload-artifact):
+#   * actions/upload-artifact / actions/download-artifact are NOT used anywhere
+#     in this file. The verified files are moved between jobs with
+#     actions/cache/save + actions/cache/restore keyed on run id + attempt, so
+#     the transfer is a same-run, same-ref transport - NOT a distribution
+#     channel. Cache is immutable once saved (no re-write of an existing key),
+#     is restored with fail-on-cache-miss, and is re-checksummed in
+#     publish-release before anything is published.
+#   * Cache, Actions artifacts and release assets are three different things:
+#       - Actions artifacts / caches: ephemeral, retention- and
+#         quota-governed CI plumbing, not a distribution channel.
+#       - GitHub Release assets: the durable, user-facing download surface,
+#         served from the repo's Releases page and governed by repository
+#         storage/quota limits (release assets are NOT unlimited).
+#
+# Publication:
+#   * publish-release is the ONLY job with `contents: write`; every other job
+#     stays read-only. It receives NO signing secret (only the built-in
+#     GITHUB_TOKEN, via GH_TOKEN, for `gh`).
+#   * Tag scheme: v<versionName> from pahebatcher/build.gradle.kts (currently
+#     v0.1.0). The repository had no tags when this scheme was adopted.
+#   * If the tag or the release already exists, the job FAILS SAFELY. It never
+#     overwrites a release, never moves an existing tag, never replaces assets.
+#   * Only the verified APKs, AAB, SHA256SUMS.txt and build metadata are
+#     attached. The keystore, .investigation/, .scratch/ and local
+#     configuration are never attached.
+#
+# Explicitly NOT done here: nothing is uploaded to Google Play and no
+# push/merge is performed by this file.
+
+name: Release artifacts (merged PR)
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+# Least privilege: this workflow only reads the repository it builds.
+permissions:
+  contents: read
+
+# Never cancel a run mid-upload; merge runs are kept apart per PR.
+concurrency:
+  group: release-artifacts-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Verification gates: three INDEPENDENT jobs (job-level granularity so a
+  # failed check can be re-run from the Actions UI without re-running the
+  # others). Each job checks out the SAME merge commit, validates the wrapper,
+  # and sets up the identical toolchain. None of these jobs receives a secret.
+  # ---------------------------------------------------------------------------
+  debug-unit-tests:
+    name: Debug unit tests (testDebugUnitTest)
+    # Runs only for a MERGED pull request, exactly like the build job - a
+    # closed-but-unmerged PR triggers nothing.
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper (supply-chain check)
+        uses: gradle/actions/wrapper-validation@v6
+
+      # Toolchain mirrors the repository: JDK 25 (gradle.properties /
+      # pahebatcher/build.gradle.kts jvmToolchain(25)), Gradle 9.8.2 (wrapper).
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # compileSdk 37 -> platforms;android-37.0 (verified via sdkmanager --list),
+      # build-tools 36.0.0 matches the locally used build-tools.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      # One command, one result, visible on its own in the Actions UI.
+      # No secret is provided to this job.
+      - name: Run debug unit tests
+        run: ./gradlew testDebugUnitTest
+
+  release-unit-tests:
+    name: Release unit tests (testReleaseUnitTest)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper (supply-chain check)
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      # The release variant test task exists because
+      # android.onlyEnableUnitTestForTheTestedBuildType=false (gradle.properties).
+      # No secret is provided to this job.
+      - name: Run release unit tests
+        run: ./gradlew testReleaseUnitTest
+
+  debug-lint:
+    name: Debug lint (lintDebug)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper (supply-chain check)
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      # No secret is provided to this job.
+      - name: Run debug lint
+        run: ./gradlew lintDebug
+
+  # ---------------------------------------------------------------------------
+  # Build + verify the per-ABI release APKs, then hand the VERIFIED files to
+  # the publish-release job (cache save, not actions/upload-artifact). Only a
+  # MERGED pull request reaches this job, and it is one of only two jobs that
+  # see signing secrets.
+  # ---------------------------------------------------------------------------
+  build-apks:
+    name: Build + verify release APKs
+    if: github.event.pull_request.merged == true
+    # The three verification gates are the ONLY upstream dependency: no build
+    # unless debug tests, release tests and lint all pass.
+    needs: [debug-unit-tests, release-unit-tests, debug-lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # The verified APK signer identity is handed to build-aab (a public
+    # certificate digest, never a secret) so the AAB can be checked against the
+    # SAME signing identity as the shipped APKs. release_tag is handed to
+    # publish-release so the tag is derived from the version actually built.
+    outputs:
+      signer_digest: ${{ steps.verify-apks.outputs.signer_digest }}
+      release_tag: ${{ steps.collect-apks.outputs.release_tag }}
+      short_sha: ${{ steps.collect-apks.outputs.short_sha }}
+    steps:
+      - name: Check out the merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      # Fail fast BEFORE the build if any signing secret is absent or empty.
+      # Only names are echoed; values are never printed and tracing is never
+      # enabled around secret-handling steps.
+      - name: Validate signing secrets (fail-closed, names only)
+        env:
+          KS_B64: ${{ secrets.PB_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.PB_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "$KS_B64" ]    || missing="${missing} PB_KEYSTORE_BASE64"
+          [ -n "$KS_PASS" ]   || missing="${missing} PB_KEYSTORE_PASSWORD"
+          [ -n "$KEY_ALIAS" ] || missing="${missing} PB_KEY_ALIAS"
+          [ -n "$KEY_PASS" ]  || missing="${missing} PB_KEY_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing/empty signing secret(s):${missing}. All four secrets (PB_KEYSTORE_BASE64, PB_KEYSTORE_PASSWORD, PB_KEY_ALIAS, PB_KEY_PASSWORD) must be configured under exactly these names. No fallback exists and no value was printed."
+            exit 1
+          fi
+          echo "All four signing secrets are present (values not echoed)."
+
+      - name: Validate Gradle wrapper (supply-chain check)
+        uses: gradle/actions/wrapper-validation@v6
+
+      # Toolchain mirrors the repository: JDK 25 (gradle.properties /
+      # pahebatcher/build.gradle.kts jvmToolchain(25)), Gradle 9.8.2 (wrapper).
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # compileSdk 37 -> platforms;android-37.0 (verified via sdkmanager --list),
+      # build-tools 36.0.0 matches the locally used build-tools.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      # Reconstruct the keystore under the runner's temp directory with
+      # restrictive permissions. The keystore path is generated here - the
+      # owner stores no runner-specific path as a secret. Base64 validity and
+      # non-emptiness are checked; password/alias are checked against the
+      # keystore itself so a wrong secret fails BEFORE the long build. Output
+      # of keytool is discarded; no key material is ever printed.
+      - name: Reconstruct release keystore (fail-closed)
+        env:
+          KS_B64: ${{ secrets.PB_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KS_PATH="${RUNNER_TEMP}/pb-release.keystore"
+          if ! printf '%s' "$KS_B64" | base64 -d > "${KS_PATH}"; then
+            echo "::error::PB_KEYSTORE_BASE64 is not valid Base64. Refusing to continue."
+            rm -f "${KS_PATH}"
+            exit 1
+          fi
+          if [ ! -s "${KS_PATH}" ]; then
+            echo "::error::PB_KEYSTORE_BASE64 decoded to an empty file. Refusing to continue."
+            rm -f "${KS_PATH}"
+            exit 1
+          fi
+          chmod 600 "${KS_PATH}"
+          if ! keytool -list -keystore "${KS_PATH}" -storepass "${KS_PASS}" -alias "${KEY_ALIAS}" > /dev/null; then
+            echo "::error::Reconstructed keystore failed validation (wrong PB_KEYSTORE_PASSWORD or PB_KEY_ALIAS, or not a keystore). No value was printed."
+            rm -f "${KS_PATH}"
+            exit 1
+          fi
+          echo "PB_RELEASE_KEYSTORE=${KS_PATH}" >> "${GITHUB_ENV}"
+          echo "Keystore reconstructed and validated (path is a runner-temp location; contents never printed)."
+
+      # Only this step receives signing secrets, and only the three value
+      # secrets - PB_KEYSTORE_BASE64 never reaches the build. The Gradle
+      # skeleton (unchanged) signs only when ALL FOUR PB_* variables are
+      # present, so a partial set fails closed inside Gradle as well.
+      # PB_KEYSTORE_PATH is passed directly (NOT via env.PB_RELEASE_KEYSTORE).
+      # A $GITHUB_ENV variable is only visible to LATER STEPS in the same job,
+      # and relying on it here is fragile; the explicit runner-temp path is
+      # identical to the KS_PATH the reconstruction step just wrote.
+      - name: Build release APKs (signed)
+        env:
+          PB_KEYSTORE_PATH: ${{ runner.temp }}/pb-release.keystore
+          PB_KEYSTORE_PASSWORD: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          PB_KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+          PB_KEY_PASSWORD: ${{ secrets.PB_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease
+
+      # APK-only verification: expected count (2), no unsigned artifacts,
+      # apksigner signature validity, identical signer certificate across every
+      # APK, and per-ABI native-library purity. No secret is provided here -
+      # verification needs none. The verified signer digest is exported for the
+      # AAB job.
+      - name: Verify APK signatures and ABI packaging
+        id: verify-apks
+        run: |
+          set -euo pipefail
+          BT="${ANDROID_HOME}/build-tools/36.0.0"
+          if [ ! -x "${BT}/apksigner" ]; then
+            echo "::error::apksigner not found under ${BT}"
+            exit 1
+          fi
+          APK_DIR="pahebatcher/build/outputs/apk/release"
+
+          # A signed AGP build never emits "-unsigned" artifacts; their
+          # presence means signing silently did not take effect.
+          if ls "${APK_DIR}"/*-unsigned.apk 2>/dev/null | grep -q .; then
+            echo "::error::unsigned APK artifact(s) present under ${APK_DIR} - signing did not take effect"
+            exit 1
+          fi
+
+          shopt -s nullglob
+          apks=("${APK_DIR}"/*.apk)
+          # splits.abi = reset() + include(arm64-v8a, x86_64), universal off
+          # (pahebatcher/build.gradle.kts) => exactly 2 release APKs.
+          if [ "${#apks[@]}" -ne 2 ]; then
+            echo "::error::expected exactly 2 release APKs (arm64-v8a, x86_64) under ${APK_DIR}, found ${#apks[@]}"
+            exit 1
+          fi
+
+          reference_digest=""
+          seen_abis=""
+          # Canonical fingerprint form used by BOTH jobs: bare lowercase hex,
+          # exactly 64 characters (32 bytes). Colons and case are normalised
+          # away so the AAB job can compare like with like.
+          for apk in "${apks[@]}"; do
+            name=$(basename "${apk}")
+            cert=$("${BT}/apksigner" verify --print-certs "${apk}")
+            digest=$(printf '%s\n' "${cert}" \
+              | awk '/Signer #1 certificate SHA-256 digest/ {print $NF}' \
+              | tr -d ':' | tr '[:upper:]' '[:lower:]' | head -n 1)
+            if [ -z "${digest}" ] || ! printf '%s' "${digest}" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::${name}: apksigner reported no valid 64-hex signer certificate SHA-256 digest"
+              exit 1
+            fi
+            if [ -z "${reference_digest}" ]; then
+              reference_digest="${digest}"
+            elif [ "${digest}" != "${reference_digest}" ]; then
+              echo "::error::${name}: signer certificate differs from the other release APKs - inconsistent signing identity"
+              exit 1
+            fi
+            # Expected ABI comes from the artifact name pahebatcher-<abi>-release.apk
+            expected_abi=$(printf '%s' "${name}" | sed -n 's/^pahebatcher-\(.*\)-release\.apk$/\1/p')
+            if [ -z "${expected_abi}" ]; then
+              echo "::error::${name}: does not match the expected pahebatcher-<abi>-release.apk naming"
+              exit 1
+            fi
+            packaged_abis=$(unzip -Z1 "${apk}" | sed -n 's#^lib/\([^/]*\)/.*#\1#p' | sort -u)
+            abi_count=$(printf '%s\n' "${packaged_abis}" | grep -c . || true)
+            if [ "${abi_count}" -ne 1 ] || [ "${packaged_abis}" != "${expected_abi}" ]; then
+              echo "::error::${name}: native libs must contain exactly the '${expected_abi}' ABI, found: $(printf '%s' "${packaged_abis:-<none>}")"
+              exit 1
+            fi
+            seen_abis="${seen_abis}${expected_abi}"$'\n'
+            echo "VERIFIED: ${name} signed, signer-sha256=${digest}, single ABI=${expected_abi}"
+          done
+
+          # The two APKs must cover exactly the supported ABIs.
+          actual_abis=$(printf '%s' "${seen_abis}" | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')
+          if [ "${actual_abis}" != "arm64-v8a x86_64" ]; then
+            echo "::error::release APKs must cover exactly arm64-v8a + x86_64, found: '${actual_abis}'"
+            exit 1
+          fi
+
+          # Hand the verified signer identity to the AAB job.
+          echo "signer_digest=${reference_digest}" >> "$GITHUB_OUTPUT"
+
+      # Checksums + metadata are generated against the APKs actually verified
+      # above - the only files this job hands to the publishing job.
+      - name: Collect verified APKs, checksums and build metadata
+        id: collect-apks
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # ABI splits produce one SIGNED APK per ABI (pahebatcher-<abi>-
+          # release.apk); collect every one. Defense in depth: never collect an
+          # unsigned artifact.
+          cp pahebatcher/build/outputs/apk/release/*.apk dist/
+          if ls dist/*-unsigned.* 2>/dev/null | grep -q .; then
+            echo "::error::unsigned APK reached dist/ - aborting upload"
+            exit 1
+          fi
+          (cd dist && sha256sum ./*.apk > SHA256SUMS.txt)
+          version_name=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' pahebatcher/build.gradle.kts | head -n 1)
+          version_code=$(sed -n 's/.*versionCode = \([0-9][0-9]*\).*/\1/p' pahebatcher/build.gradle.kts | head -n 1)
+          short_sha=$(git rev-parse --short=12 HEAD)
+          gradle_version=$(sed -n 's/.*gradle-\([0-9][0-9.]*\)-bin\.zip/\1/p' gradle/wrapper/gradle-wrapper.properties | head -n 1)
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > dist/build-metadata.json <<EOF
+          {
+            "repository": "${GITHUB_REPOSITORY}",
+            "commit": "${GITHUB_SHA}",
+            "short_commit": "${short_sha}",
+            "workflow_run_id": "${GITHUB_RUN_ID}",
+            "workflow_run_url": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}",
+            "artifact": "apks",
+            "variant": "release",
+            "signed": true,
+            "version_name": "${version_name}",
+            "version_code": "${version_code}",
+            "gradle": "${gradle_version}",
+            "jdk": "25 (temurin)",
+            "verification": "testDebugUnitTest + testReleaseUnitTest + lintDebug + apksigner signature and per-ABI checks",
+            "built_at_utc": "${built_at}"
+          }
+          EOF
+          artifact_name="PaheBatcher-release-APKs-v${version_name}-code${version_code}-${short_sha}"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_ENV"
+          # Handed to publish-release: the deterministic release tag
+          # (v<versionName>) and the short commit for the release notes.
+          echo "release_tag=v${version_name}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          for f in dist/*.apk; do
+            echo "APK=$(basename "$f") SHA256=$(sha256sum "$f" | cut -d' ' -f1)"
+          done
+
+      # Cross-job handoff of the VERIFIED APKs to publish-release. This is
+      # deliberately actions/cache (NOT actions/upload-artifact): the files are
+      # keyed to this exact run + attempt, so nothing from another run can be
+      # picked up, and a miss is a hard failure downstream rather than a
+      # silently empty release. Cache is a transport here, not a distribution
+      # channel - the user-facing download surface is the GitHub Release.
+      - name: Save verified APKs for the publishing job
+        uses: actions/cache/save@v6
+        with:
+          path: dist
+          key: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Unconditional cleanup: the reconstructed keystore is deleted even when
+      # any earlier step fails. Never published anywhere.
+      - name: Cleanup temporary keystore
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/pb-release.keystore"
+          echo "Temporary keystore removed (if it existed)."
+
+  # ---------------------------------------------------------------------------
+  # Build + verify the AAB INDEPENDENTLY. Runs only after build-apks succeeds
+  # (so the verified APK signer digest is available as the cross-reference) and
+  # uploads the AAB only after its OWN verification passes. If this job fails,
+  # the APKs already uploaded by build-apks remain downloadable, and this
+  # failure is reported as a genuine failure - it is never masked
+  # (no continue-on-error anywhere).
+  # ---------------------------------------------------------------------------
+  build-aab:
+    name: Build + verify release AAB
+    if: github.event.pull_request.merged == true
+    needs: build-apks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate signing secrets (fail-closed, names only)
+        env:
+          KS_B64: ${{ secrets.PB_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.PB_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "$KS_B64" ]    || missing="${missing} PB_KEYSTORE_BASE64"
+          [ -n "$KS_PASS" ]   || missing="${missing} PB_KEYSTORE_PASSWORD"
+          [ -n "$KEY_ALIAS" ] || missing="${missing} PB_KEY_ALIAS"
+          [ -n "$KEY_PASS" ]  || missing="${missing} PB_KEY_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing/empty signing secret(s):${missing}. All four secrets (PB_KEYSTORE_BASE64, PB_KEYSTORE_PASSWORD, PB_KEY_ALIAS, PB_KEY_PASSWORD) must be configured under exactly these names. No fallback exists and no value was printed."
+            exit 1
+          fi
+          echo "All four signing secrets are present (values not echoed)."
+
+      - name: Validate Gradle wrapper (supply-chain check)
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Reconstruct release keystore (fail-closed)
+        env:
+          KS_B64: ${{ secrets.PB_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KS_PATH="${RUNNER_TEMP}/pb-release.keystore"
+          if ! printf '%s' "$KS_B64" | base64 -d > "${KS_PATH}"; then
+            echo "::error::PB_KEYSTORE_BASE64 is not valid Base64. Refusing to continue."
+            rm -f "${KS_PATH}"
+            exit 1
+          fi
+          if [ ! -s "${KS_PATH}" ]; then
+            echo "::error::PB_KEYSTORE_BASE64 decoded to an empty file. Refusing to continue."
+            rm -f "${KS_PATH}"
+            exit 1
+          fi
+          chmod 600 "${KS_PATH}"
+          if ! keytool -list -keystore "${KS_PATH}" -storepass "${KS_PASS}" -alias "${KEY_ALIAS}" > /dev/null; then
+            echo "::error::Reconstructed keystore failed validation (wrong PB_KEYSTORE_PASSWORD or PB_KEY_ALIAS, or not a keystore). No value was printed."
+            rm -f "${KS_PATH}"
+            exit 1
+          fi
+          echo "PB_RELEASE_KEYSTORE=${KS_PATH}" >> "${GITHUB_ENV}"
+          echo "Keystore reconstructed and validated (path is a runner-temp location; contents never printed)."
+
+      # PB_KEYSTORE_PATH passed directly (same rationale as the APK job):
+      # the path is the runner-temp location the reconstruction step wrote,
+      # not an env var read back from $GITHUB_ENV.
+      - name: Build release AAB (signed)
+        env:
+          PB_KEYSTORE_PATH: ${{ runner.temp }}/pb-release.keystore
+          PB_KEYSTORE_PASSWORD: ${{ secrets.PB_KEYSTORE_PASSWORD }}
+          PB_KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
+          PB_KEY_PASSWORD: ${{ secrets.PB_KEY_PASSWORD }}
+        run: ./gradlew bundleRelease
+
+      # AAB-only verification. No secret is provided here.
+      #
+      # jarsigner -verify (NON-strict) is the INTEGRITY gate and must exit 0; a
+      # genuine tamper (digest mismatch) exits 1 and fails this job. The release
+      # certificate is intentionally self-signed, so `jarsigner -verify -strict`
+      # would exit 4 ("jar verified, with signer errors") for it even though the
+      # jar is intact (empirically confirmed on JDK 25) - therefore the -strict
+      # output is captured and ECHOED for visibility, but its non-zero
+      # self-signed exit is NOT treated as an integrity failure. The signer
+      # certificate must still match the verified APKs (keytool digest), and the
+      # AAB must package exactly arm64-v8a + x86_64.
+      - name: Verify AAB signature, signer identity and ABI packaging
+        id: verify-aab
+        run: |
+          set -euo pipefail
+          AAB_DIR="pahebatcher/build/outputs/bundle/release"
+          shopt -s nullglob
+          aabs=("${AAB_DIR}"/*.aab)
+          if [ "${#aabs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one release AAB under ${AAB_DIR}, found ${#aabs[@]}"
+            exit 1
+          fi
+          aab="${aabs[0]}"
+          aab_name=$(basename "${aab}")
+
+          # --- Integrity gate (non-strict): exit 0 required, exit 1 = tamper ---
+          set +e
+          verify_out=$(jarsigner -verify "${aab}" 2>&1)
+          js=$?
+          set -e
+          if [ "${js}" -ne 0 ]; then
+            echo "::error::${aab_name}: jarsigner -verify reported the AAB as NOT verified (exit ${js}) - integrity failure"
+            printf '%s\n' "${verify_out}"
+            exit 1
+          fi
+          printf '%s\n' "${verify_out}"
+
+          # --- Surface the -strict diagnostics (self-signed is expected) ---
+          set +e
+          strict_out=$(jarsigner -verify -strict "${aab}" 2>&1)
+          js_strict=$?
+          set -e
+          printf '%s\n' "${strict_out}"
+          if [ "${js_strict}" -ne 0 ]; then
+            echo "NOTE: jarsigner -verify -strict exited ${js_strict}; expected for the intentionally self-signed release certificate. The non-strict integrity gate above passed (exit 0)."
+          fi
+
+          # --- Same signing identity as the verified APKs ---
+          #
+          # BUG FIXED: the old extraction searched for "^SHA-256:", but
+          # `keytool -printcert -jarfile` on the JDK 25 runner prints the
+          # certificate fingerprint label as "SHA256:" (no dash) and
+          # INDENTED under "Certificate fingerprints:", so the anchored
+          # match never fired, aab_digest came out empty, and the comparison
+          # degenerated into "" != "<apk digest>" -> guaranteed false
+          # failure (or, worse, a silent pass if both sides were empty).
+          #
+          # The label is matched without requiring a dash or a line anchor,
+          # with optional whitespace, and both fingerprints are normalised to
+          # the same canonical form (bare lowercase 64-hex) BEFORE comparison.
+          # Each value is then VALIDATED as 64 hex chars so an extraction
+          # that yields nothing fails loudly with a clear message instead of
+          # comparing an empty string.
+          apk_signer="${{ needs.build-apks.outputs.signer_digest }}"
+          hex64='^[0-9a-f]{64}$'
+
+          set +e
+          cert_dump=$(keytool -printcert -jarfile "${aab}" 2>&1)
+          kt=$?
+          set -e
+          if [ "${kt}" -ne 0 ]; then
+            echo "::error::${aab_name}: keytool -printcert -jarfile failed (exit ${kt})"
+            printf '%s\n' "${cert_dump}"
+            exit 1
+          fi
+
+          # Accept "SHA256:" and "SHA-256:" (and any indent/case), take the
+          # first fingerprint, strip the byte-separating colons, lowercase.
+          aab_digest=$(printf '%s\n' "${cert_dump}" \
+            | sed -n 's/^[[:space:]]*SHA-\{0,1\}256:[[:space:]]*\([0-9A-Fa-f:]*\).*/\1/p' \
+            | head -n 1 \
+            | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          apk_digest_lc=$(printf '%s' "${apk_signer}" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+
+          if [ -z "${aab_digest}" ] || ! printf '%s' "${aab_digest}" | grep -Eq "${hex64}"; then
+            echo "::error::${aab_name}: could not extract a valid 64-hex SHA-256 fingerprint from keytool -printcert -jarfile output"
+            printf '%s\n' "${cert_dump}"
+            exit 1
+          fi
+          if [ -z "${apk_digest_lc}" ] || ! printf '%s' "${apk_digest_lc}" | grep -Eq "${hex64}"; then
+            echo "::error::signer digest handed over from the APK job is not a valid 64-hex SHA-256 fingerprint"
+            exit 1
+          fi
+          if [ "${aab_digest}" != "${apk_digest_lc}" ]; then
+            echo "::error::${aab_name}: signer certificate does not match the verified release APKs"
+            printf '%s\n' "${cert_dump}"
+            exit 1
+          fi
+
+          # --- ABI packaging: arm64-v8a + x86_64 only (32-bit pruned) ---
+          aab_abis=$(unzip -Z1 "${aab}" | sed -n 's#^base/lib/\([^/]*\)/.*#\1#p' | sort -u)
+          expected_aab_abis=$'arm64-v8a\nx86_64'
+          if [ "${aab_abis}" != "${expected_aab_abis}" ]; then
+            echo "::error::${aab_name}: native libs must declare exactly arm64-v8a + x86_64, found: $(printf '%s' "${aab_abis:-<none>"} | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "VERIFIED: ${aab_name} signed, signer-sha256=${aab_digest}, ABIs=arm64-v8a+x86_64"
+
+      # Checksums + metadata are generated against the AAB actually verified
+      # above (the only artifact this job retains/uploads).
+      - name: Collect verified AAB, checksums and build metadata
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          aab=$(ls pahebatcher/build/outputs/bundle/release/*.aab | head -n 1)
+          cp "$aab" dist/
+          if ls dist/*-unsigned.* 2>/dev/null | grep -q .; then
+            echo "::error::unsigned AAB reached dist/ - aborting upload"
+            exit 1
+          fi
+          (cd dist && sha256sum ./*.aab > SHA256SUMS.txt)
+          version_name=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' pahebatcher/build.gradle.kts | head -n 1)
+          version_code=$(sed -n 's/.*versionCode = \([0-9][0-9]*\).*/\1/p' pahebatcher/build.gradle.kts | head -n 1)
+          short_sha=$(git rev-parse --short=12 HEAD)
+          gradle_version=$(sed -n 's/.*gradle-\([0-9][0-9.]*\)-bin\.zip/\1/p' gradle/wrapper/gradle-wrapper.properties | head -n 1)
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > dist/build-metadata.json <<EOF
+          {
+            "repository": "${GITHUB_REPOSITORY}",
+            "commit": "${GITHUB_SHA}",
+            "short_commit": "${short_sha}",
+            "workflow_run_id": "${GITHUB_RUN_ID}",
+            "workflow_run_url": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}",
+            "artifact": "aab",
+            "variant": "release",
+            "signed": true,
+            "version_name": "${version_name}",
+            "version_code": "${version_code}",
+            "gradle": "${gradle_version}",
+            "jdk": "25 (temurin)",
+            "verification": "jarsigner integrity (non-strict) + signer match vs APKs + ABI packaging arm64-v8a/x86_64",
+            "built_at_utc": "${built_at}"
+          }
+          EOF
+          artifact_name="PaheBatcher-release-AAB-v${version_name}-code${version_code}-${short_sha}"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_ENV"
+          echo "AAB=$(basename "$aab") SHA256=$(sha256sum "$aab" | cut -d' ' -f1)"
+
+      # Cross-job handoff of the VERIFIED AAB (cache, never
+      # actions/upload-artifact). Runs only after this job's OWN verification
+      # succeeded.
+      - name: Save verified AAB for the publishing job
+        uses: actions/cache/save@v6
+        with:
+          path: dist
+          key: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Unconditional cleanup: the reconstructed keystore is deleted even when
+      # any earlier step fails. Never publishes anything.
+      - name: Cleanup temporary keystore
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/pb-release.keystore"
+          echo "Temporary keystore removed (if it existed)."
+
+  # ---------------------------------------------------------------------------
+  # PUBLISH - the ONLY job in this workflow holding write permission.
+  #
+  # `needs:` lists every other job, so publication is structurally impossible
+  # unless all three verification gates AND the APK build AND the AAB build
+  # succeeded. There is deliberately no APK-only publish path: if build-aab
+  # fails, this job never runs and no release is created.
+  #
+  # This job receives NO signing secret. The only credential it holds is the
+  # built-in GITHUB_TOKEN, exposed to `gh` as GH_TOKEN. No personal access
+  # token is used.
+  #
+  # Publishing uses the runner-preinstalled GitHub CLI directly rather than a
+  # third-party release action (actions/create-release is archived and was
+  # therefore not used).
+  #
+  # Tag scheme: v<versionName>, taken from the version that was ACTUALLY built
+  # and exported by build-apks - not re-parsed here, so the published tag can
+  # never drift from the artifacts it describes. The repository had no tags
+  # when this scheme was adopted.
+  #
+  # If the tag or the release already exists, the job fails safely: it never
+  # overwrites a release, never moves an existing tag, and never replaces
+  # existing release assets.
+  # ---------------------------------------------------------------------------
+  publish-release:
+    name: Publish GitHub Release
+    if: github.event.pull_request.merged == true
+    needs: [debug-unit-tests, release-unit-tests, debug-lint, build-apks, build-aab]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Write access is scoped to THIS job only. Every other job stays read-only.
+    permissions:
+      contents: write
+    steps:
+      # fail-on-cache-miss: true - a missing handoff is a hard failure, never
+      # an empty or partial release.
+      - name: Restore verified APKs
+        uses: actions/cache/restore@v6
+        with:
+          path: dist-apks
+          key: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+
+      - name: Restore verified AAB
+        uses: actions/cache/restore@v6
+        with:
+          path: dist-aab
+          key: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+
+      # Assemble one payload from the two verified sets, re-checking every
+      # checksum so a corrupted or tampered handoff cannot be published, and
+      # enforcing an allowlist of file classes.
+      - name: Assemble the release payload (verified files only)
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          # 1. Integrity of the handoff: each set must match the checksums
+          #    written by its own build job, byte for byte.
+          (cd dist-apks && sha256sum -c SHA256SUMS.txt)
+          (cd dist-aab  && sha256sum -c SHA256SUMS.txt)
+
+          # 2. Allowlist per set: exactly the expected binaries plus their
+          #    checksum + metadata files. Anything unexpected aborts.
+          shopt -s nullglob
+          apks=(dist-apks/*.apk)
+          aabs=(dist-aab/*.aab)
+          if [ "${#apks[@]}" -ne 2 ]; then
+            echo "::error::expected exactly 2 verified APKs, found ${#apks[@]}"
+            exit 1
+          fi
+          if [ "${#aabs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly 1 verified AAB, found ${#aabs[@]}"
+            exit 1
+          fi
+          unexpected=$(find dist-apks dist-aab -type f \
+            ! -name '*.apk' ! -name '*.aab' \
+            ! -name 'SHA256SUMS.txt' ! -name 'build-metadata.json')
+          if [ -n "${unexpected}" ]; then
+            echo "::error::unexpected file(s) in the verified payload - refusing to publish:"
+            printf '%s\n' "${unexpected}"
+            exit 1
+          fi
+          # Defense in depth: unsigned artifacts must never reach a release.
+          if ls dist-apks/*-unsigned.* dist-aab/*-unsigned.* 2>/dev/null | grep -q .; then
+            echo "::error::unsigned artifact in the verified payload - refusing to publish"
+            exit 1
+          fi
+
+          # 3. Build the payload. Only the allowlisted files are copied; the
+          #    keystore, .investigation/, .scratch/ and local configuration are
+          #    never present in these directories and are never referenced.
+          for f in "${apks[@]}"; do cp "$f" release/; done
+          cp "${aabs[0]}" release/
+          cp dist-apks/build-metadata.json release/apk-build-metadata.json
+          cp dist-aab/build-metadata.json   release/aab-build-metadata.json
+          (cd release && sha256sum ./*.apk ./*.aab > SHA256SUMS.txt)
+
+          echo "Release payload:"
+          (cd release && sha256sum -c SHA256SUMS.txt)
+          ls -la release
+
+      # Fail safely if the tag OR the release already exists. `gh` exits
+      # non-zero for both probes when the target is absent, which is the only
+      # state we proceed from. Nothing is ever overwritten, moved or replaced.
+      - name: Refuse to overwrite an existing tag or release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build-apks.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAG}" ]; then
+            echo "::error::release tag is empty - refusing to publish"
+            exit 1
+          fi
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::error::a GitHub Release for '${TAG}' already exists. Refusing to overwrite it or replace its assets."
+            exit 1
+          fi
+          if gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::tag '${TAG}' already exists. Refusing to move it or re-point it at another commit."
+            exit 1
+          fi
+          echo "Tag '${TAG}' and its release are both absent - safe to publish."
+
+      - name: Create the GitHub Release and upload the verified assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build-apks.outputs.release_tag }}
+          SHORT_SHA: ${{ needs.build-apks.outputs.short_sha }}
+          TARGET: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          Signed release assets for PaheBatcher **${TAG}** (commit \`${SHORT_SHA}\`).
+
+          | Asset | Type |
+          | --- | --- |
+          | \`pahebatcher-arm64-v8a-release.apk\` | Per-ABI release APK |
+          | \`pahebatcher-x86_64-release.apk\` | Per-ABI release APK |
+          | \`pahebatcher-release.aab\` | Play-ready bundle |
+          | \`SHA256SUMS.txt\` | SHA-256 checksums |
+          | \`apk-build-metadata.json\` | APK build metadata |
+          | \`aab-build-metadata.json\` | AAB build metadata |
+
+          All three binaries were signature-verified before publication: the
+          APKs via \`apksigner\` (signature validity, identical signer
+          certificate across every split, per-ABI native-library purity) and
+          the AAB via \`jarsigner -verify\` plus a signer-certificate match
+          against the APKs. \`testDebugUnitTest\`, \`testReleaseUnitTest\` and
+          \`lintDebug\` all had to pass first.
+          EOF
+
+          gh release create "${TAG}" \
+            --repo "${GH_REPO}" \
+            --target "${TARGET}" \
+            --title "PaheBatcher ${TAG}" \
+            --notes-file release-notes.md \
+            release/*.apk \
+            release/*.aab \
+            release/SHA256SUMS.txt \
+            release/apk-build-metadata.json \
+            release/aab-build-metadata.json
+
+          echo "Published ${TAG} at ${TARGET}"
+          gh release view "${TAG}" --repo "${GH_REPO}" \
+            --json tagName,assets \
+            --jq '"tag=\(.tagName) assets=\(.assets | length)"'

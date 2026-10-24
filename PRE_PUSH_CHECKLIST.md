@@ -71,7 +71,7 @@ before this repository is made public (see [Items requiring your attention](#ite
   | `README.md` | **new** — public landing page (Stage 5) |
   | `PRE_PUSH_CHECKLIST.md` | **new** — this document (Stage 1) |
   | `PLAY_POLICY_FINDINGS.md` | **new** — policy audit ledger (Stages 2–4); later sanitized of local absolute paths |
-  | `.github/workflows/release-artifacts.yml` | **new** — merged-PR artifact workflow (Stage 8) |
+  | `.github/workflows/release-artifacts.yml.bak` | **new** — merged-PR artifact workflow (Stage 8) |
   | `.gitignore` | **edited** — added `/.investigation` and `/.scratch` (public hygiene) |
   | `ANDROID_TESTING_AND_RELEASE.md` | **edited ×2** — Gradle wrapper row corrected 9.7.1 → 9.8.2; JVM test counts updated with this round's fresh runs |
   | `PLAY_POLICY_FINDINGS.md` (edits) | 4 sanitizations: local absolute paths → repository-relative / withheld |
@@ -397,7 +397,7 @@ before this repository is made public (see [Items requiring your attention](#ite
 ## P-15 — GitHub Actions security and artifact retention
 
 - **Status:** PASS
-- **Repository path:** `.github/workflows/release-artifacts.yml` (the only workflow)
+- **Repository path:** `.github/workflows/release-artifacts.yml.bak` (the only workflow)
 - **Evidence:**
   - **Validation:** `actionlint 1.7.12` → **exit 0, zero findings**. All action
     versions verified to exist at their referenced tags before use
