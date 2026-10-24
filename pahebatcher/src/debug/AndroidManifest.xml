@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Phase 13 SAF test infrastructure (DECISIONS 92.8/104.7).
+
+  A REAL DocumentsProvider (real filesystem behind it, standard SAF contract
+  including rename-less roots) used ONLY by instrumentation tests to exercise
+  the production SAF export path end-to-end without a human picker. Declared
+  here so it exists in debug/test builds only — release manifests never see it,
+  and no production code references its authority.
+
+  Phase 14 (PHASE14_PLAN §17): `android:networkSecurityConfig` points at
+  src/debug/res/xml/network_security_config.xml, which opens cleartext for the
+  LOOPBACK address only so AutoResumeConnectivityTest can drive the real
+  DownloadWorker/OkHttp path against an in-process HLS fixture. Debug-only —
+  release manifests never see it; every non-loopback destination keeps the
+  platform default (cleartext denied).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:icon="@mipmap/ic_launcher_debug"
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:replace="android:icon">
+        <provider
+            android:name="com.pahebatcher.app.testdocs.PBTestDocumentsProvider"
+            android:authorities="${applicationId}.testdocs"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+
+        <activity
+            android:name="com.pahebatcher.app.testdocs.PBGrantProbeActivity"
+            android:exported="false" />
+    </application>
+
+</manifest>

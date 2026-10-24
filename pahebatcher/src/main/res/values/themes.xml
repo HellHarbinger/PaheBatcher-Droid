@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Phase 11 (PHASE11_ARCHITECTURE_V2 §4/§8): dark-first-frame XML theme.
+         The pre-Compose window is dark by default (matching the product's dark-by-
+         default theme) so cold start with the default DARK preference renders the
+         correct first frame with no flash. LIGHT-persisted users see this dark frame
+         once until Compose applies the light scheme (accepted §8 tradeoff — do NOT
+         add a second theme persistence mechanism to "fix" this). -->
+    <style name="Theme.PaheBatcher" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+    </style>
+</resources>

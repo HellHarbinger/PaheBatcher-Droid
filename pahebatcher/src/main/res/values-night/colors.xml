@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Phase 11 (§4/§8): night-window background matches the dark outer-space void. -->
+    <color name="window_background">#05070D</color>
+</resources>
