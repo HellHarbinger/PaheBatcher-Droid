@@ -60,7 +60,7 @@ logo will be updated in a future revision.
 | Settings surface (appearance, download engine, storage, notifications, diagnostics) | **Implemented** |
 | Google Play listing | **Unavailable** — the app is not published; the policy scan returns HTTP 404 for the package, as expected |
 | Play Console declarations (Data Safety, foreground-service types) | **Externally blocked** — can only be completed by the maintainer in Play Console; see [`PLAY_POLICY_FINDINGS.md`](PLAY_POLICY_FINDINGS.md) |
-| CI-signed release artifacts | **Not configured** — CI builds are unsigned by design; signing stays a local, maintainer-only step (see [GitHub Actions artifacts](#github-actions-artifacts)) |
+| CI-signed release artifacts | **Configured** — merged PRs build signed, per-ABI release APKs + AAB in CI; signing uses the maintainer's release identity stored as repository secrets, and every artifact is signature- and ABI-verified before upload (see [GitHub Actions artifacts](#github-actions-artifacts)) |
 | Open-source license | **GPL-3.0-or-later** since 2026-10-24 - see [License](#license) |
 
 Per-phase completion history (phases 1–17.7 plus later audit/closure rounds) is
@@ -126,12 +126,12 @@ Play Store distribution.
 
 ## Installing and using the release APK
 
-> **Where do I get an installable APK?** CI artifacts are **unsigned** (see
-> [GitHub Actions artifacts](#github-actions-artifacts)) and cannot be installed.
-> An installable, signed APK (the split matching your device's ABI) is produced
-> **locally by the maintainer**
-> with the existing release signing identity. Until this project publishes releases,
-> ask the maintainer for the signed APK.
+> **Where do I get an installable APK?** Merged pull requests produce **signed,
+> installable** release artifacts through the workflow (see
+> [GitHub Actions artifacts](#github-actions-artifacts)). Download the artifact zip
+> from that run and pick the split matching your device's ABI. Each APK is signed with
+> the maintainer's release identity and is signature- and ABI-verified before upload,
+> so it installs directly with `adb`.
 
 ### Choose the APK that matches your device's CPU (ABI)
 
@@ -140,8 +140,8 @@ Release and debug builds are split **per CPU ABI** (`splits.abi` in
 
 | APK file | CPU ABI (download selection) | Typical devices |
 |---|---|---|
-| `pahebatcher-arm64-v8a-release-unsigned.apk` | `arm64-v8a` - 64-bit ARM | Essentially every Android phone/tablet sold since ~2017 |
-| `pahebatcher-x86_64-release-unsigned.apk` | `x86_64` | Default Android emulators on x86_64 hosts; a few Chromebooks |
+| `pahebatcher-arm64-v8a-release.apk` | `arm64-v8a` - 64-bit ARM | Essentially every Android phone/tablet sold since ~2017 |
+| `pahebatcher-x86_64-release.apk` | `x86_64` | Default Android emulators on x86_64 hosts; a few Chromebooks |
 
 **32-bit devices (`armeabi-v7a`, `x86`) are not supported.** The media engine
 (FFmpegKit 8.1.7) ships native libraries for the two ABIs above only; the 32-bit
@@ -377,7 +377,7 @@ Notification channels:
 
 | | Debug | Release |
 |---|---|---|
-| Signing | Android debug key | **Maintainer's release identity**, applied locally out-of-band via the env-gated `signingConfigs.release` block (`PB_*` variables, fail-closed - see [`signing.env.example`](signing.env.example); no key material in the repo). CI never sets those variables, so CI builds stay unsigned |
+| Signing | Android debug key | **Maintainer's release identity**, applied via the env-gated `signingConfigs.release` block (`PB_*` variables, fail-closed - see [`signing.env.example`](signing.env.example); no key material in the repo). For merged PRs, CI sets these from repository secrets, so **release builds are signed** |
 | Validation overlay + spike validators (`KwikValidator`, `OkHttpValidator`, `WebViewSessionValidator`) | present in `pahebatcher/src/debug/` | **absent** — release compiles a documented no-op seam (`pahebatcher/src/release/…/ValidationOverlayEntry.kt`) |
 | Test-only components (`PBGrantProbeActivity`, `PBTestDocumentsProvider`) | present (debug manifest only) | **absent** |
 | `android:networkSecurityConfig` (cleartext for `127.0.0.1` test fixture) | yes (debug manifest) | **absent** |
@@ -398,27 +398,29 @@ Workflow: [`.github/workflows/release-artifacts.yml`](.github/workflows/release-
 
 | Aspect | Behavior |
 |---|---|
-| Trigger | `pull_request` **closed** — the job runs **only if the PR was merged**; a closed-unmerged PR produces nothing. A `workflow_dispatch` trigger allows manual runs. |
+| Trigger | `pull_request` **closed** targeting `main` — runs **only if the PR was merged**; a closed-unmerged PR produces nothing. Deliberately **no** `push` and **no** `workflow_dispatch` trigger: signed artifacts come only from a merged PR. |
 | Commit built | the PR's merge commit (`merge_commit_sha`), i.e. the merged base-branch commit |
-| Verification before upload | `testDebugUnitTest` + `testReleaseUnitTest` + `lintDebug` must pass |
+| Verification gates | three independent jobs — `testDebugUnitTest`, `testReleaseUnitTest`, `lintDebug` — must all pass before the build job runs; each can be re-run in isolation from the *Actions* UI |
 | Build tasks | `assembleRelease` + `bundleRelease` |
-| Artifact name | `PaheBatcher-release-unsigned-v<version>-code<N>-<short-sha>` |
-| Contents | per-ABI APKs (arm64-v8a, x86_64), AAB, `SHA256SUMS.txt`, `build-metadata.json` (commit, version, toolchain, run URL) |
+| Signing | **signed** — the build job reconstructs the maintainer's keystore from four repository secrets (`PB_KEYSTORE_BASE64`, `PB_KEYSTORE_PASSWORD`, `PB_KEY_ALIAS`, `PB_KEY_PASSWORD`) and fails closed if any is missing or invalid. The keystore lives only in runner temp and is deleted in an unconditional cleanup step. Only the build job sees secrets; verification jobs never do. |
+| Post-build verification | `apksigner` (APK signature validity, identical signer certificate across all outputs, per-ABI native-library purity) + `jarsigner` (AAB) + SHA-256 checksums; Gradle success alone is never trusted |
+| Artifact name | `PaheBatcher-release-v<version>-code<N>-<short-sha>` |
+| Contents | per-ABI **signed** APKs (arm64-v8a, x86_64), signed AAB, `SHA256SUMS.txt`, `build-metadata.json` (commit, version, toolchain, run URL) |
 | Retention | 90 days (explicit) |
 | Permissions | `contents: read` only |
-| Signing | **unsigned** - the workflow never sets the `PB_*` signing variables; no keystore or secret exists in this repository or in the workflow |
 | Not done | no GitHub Release is created, nothing is uploaded to Google Play |
 
-**Obtaining artifacts:** after this workflow exists on GitHub, merge a pull request
-(or run the workflow manually from the *Actions* tab → *Release artifacts (merged PR)*
-→ *Run workflow*), then download the artifact zip from that run's summary page.
-Because the artifacts are unsigned they are meant for **review** (checksums, manifest
-inspection, test logs); an installable APK still comes from the maintainer's local
-signed build. The Gradle side of release signing exists but is env-gated and
-fail-closed (`signingConfigs.release` driven by `PB_*` variables - see
-[`signing.env.example`](signing.env.example)); enabling CI signing would still
-require the separate, human-approved step of configuring repository secrets, which
-never happens automatically.
+**Obtaining artifacts:** merge a pull request into `main`, then download the artifact
+zip from that run's summary page in the *Actions* tab (*Release artifacts (merged PR)*).
+The zip contains per-ABI **signed** APKs plus the signed AAB, their SHA-256 checksums
+and build metadata. Pick the APK matching your device's ABI (see
+[Installing and using the release APK](#installing-and-using-the-release-apk)), verify
+its SHA-256 against `SHA256SUMS.txt`, and install it with `adb install -r`. Signing is
+fail-closed and env-gated (`signingConfigs.release` driven by the `PB_*` variables —
+see [`signing.env.example`](signing.env.example)); the four signing secrets are
+configured once by the maintainer as repository secrets and never committed. The
+keystore is reconstructed only inside the build job and deleted in an unconditional
+cleanup step, so no key material is retained.
 
 ---
 

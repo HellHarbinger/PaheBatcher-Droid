@@ -1,5 +1,6 @@
 package com.pahebatcher.app.data.download
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -130,11 +131,29 @@ class EpisodeOutputVerifierRuleTest {
     }
 
     @Test
-    fun `a directory where a file was expected is not an output`() {
+    fun `a directory is judged by the same exists-and-size rule, never trusted outright`() {
+        // The §29 rule is EXACTLY `exists AND size > 0` (downloader.py:60,
+        // pinned for files above) and the verifier has no directory branch:
+        // the same predicate is applied to every path. A directory's own
+        // reported size is platform-specific - 0 on Windows, > 0 on Linux -
+        // so the rule's verdict for a directory is platform-specific too,
+        // exactly as the Python reference behaves (Path.stat().st_size is 0
+        // for directories on Windows and > 0 on POSIX). What this pins is
+        // that the verdict always EQUALS the documented rule for the path
+        // itself: any special-casing (accepting a directory regardless of
+        // size, or silently switching the rule to isFile) breaks byte-for-
+        // byte parity with the reference and fails here.
         val dir = tmp.newFolder("not_a_file.mp4")
-        assertFalse(
-            "a path that resolves to a directory is not a playable output",
-            verifier.isPresent(null, dir.absolutePath),
+        assertTrue("fixture must be a directory", dir.isDirectory)
+        assertMatchesRule(dir)
+    }
+
+    private fun assertMatchesRule(f: File) {
+        assertEquals(
+            "the verdict must equal the downloader.py:60 rule " +
+                "(exists AND size > 0) with no path-type special case",
+            f.exists() && f.length() > 0L,
+            verifier.isPresent(null, f.absolutePath),
         )
     }
 

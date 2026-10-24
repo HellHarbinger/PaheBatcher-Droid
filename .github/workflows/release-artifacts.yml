@@ -30,6 +30,18 @@
 #   * The temporary keystore is deleted in an unconditional cleanup step,
 #     including after failed builds. It is never uploaded as an artifact.
 #
+# Job structure (verification split for job-level rerun granularity):
+#   * THREE independent verification jobs - debug-unit-tests
+#     (testDebugUnitTest), release-unit-tests (testReleaseUnitTest) and
+#     debug-lint (lintDebug) - gate ONE build job via `needs:`. All commands
+#     and results are visible as separate checks in the Actions UI, and
+#     "Re-run failed jobs" reruns only the check that failed (plus its
+#     dependents), not the other verification jobs.
+#   * Every job checks out the SAME merge commit and sets up the same
+#     JDK 25 / Android SDK / Gradle toolchain; none of the verification jobs
+#     receives any secret. The build job is the only job that sees signing
+#     secrets, and it runs only after all three gates pass.
+#
 # Explicitly NOT done here: no GitHub Release is created, nothing is uploaded to
 # Google Play, no push/merge is performed by this file, and only the paths listed
 # under `dist/` are uploaded (never .investigation/, .scratch/, keystores or local
@@ -52,10 +64,131 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Verification gates: three INDEPENDENT jobs (job-level granularity so a
+  # failed check can be re-run from the Actions UI without re-running the
+  # others). Each job checks out the SAME merge commit, validates the wrapper,
+  # and sets up the identical toolchain. None of these jobs receives a secret.
+  # ---------------------------------------------------------------------------
+  debug-unit-tests:
+    name: Debug unit tests (testDebugUnitTest)
+    # Runs only for a MERGED pull request, exactly like the build job - a
+    # closed-but-unmerged PR triggers nothing.
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper (supply-chain check)
+        uses: gradle/actions/wrapper-validation@v6
+
+      # Toolchain mirrors the repository: JDK 25 (gradle.properties /
+      # pahebatcher/build.gradle.kts jvmToolchain(25)), Gradle 9.8.2 (wrapper).
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # compileSdk 37 -> platforms;android-37.0 (verified via sdkmanager --list),
+      # build-tools 36.0.0 matches the locally used build-tools.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      # One command, one result, visible on its own in the Actions UI.
+      # No secret is provided to this job.
+      - name: Run debug unit tests
+        run: ./gradlew testDebugUnitTest
+
+  release-unit-tests:
+    name: Release unit tests (testReleaseUnitTest)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper (supply-chain check)
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      # The release variant test task exists because
+      # android.onlyEnableUnitTestForTheTestedBuildType=false (gradle.properties).
+      # No secret is provided to this job.
+      - name: Run release unit tests
+        run: ./gradlew testReleaseUnitTest
+
+  debug-lint:
+    name: Debug lint (lintDebug)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the merged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper (supply-chain check)
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Set up Gradle (caching + wrapper reuse)
+        uses: gradle/actions/setup-gradle@v6
+
+      # No secret is provided to this job.
+      - name: Run debug lint
+        run: ./gradlew lintDebug
+
   build:
     name: Build release APK + AAB
     # A closed-but-unmerged PR fails this condition and produces no artifact.
     if: github.event.pull_request.merged == true
+    # The three verification jobs are the ONLY dependency: no artifact is
+    # built unless debug tests, release tests and lint all pass (the same
+    # gate this job enforced itself before the split).
+    needs: [debug-unit-tests, release-unit-tests, debug-lint]
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -66,7 +199,7 @@ jobs:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
-      # Fail fast BEFORE tests/build if any signing secret is absent or empty.
+      # Fail fast BEFORE the build if any signing secret is absent or empty.
       # Only names are echoed; values are never printed and tracing is never
       # enabled around secret-handling steps.
       - name: Validate signing secrets (fail-closed, names only)
@@ -109,13 +242,6 @@ jobs:
 
       - name: Set up Gradle (caching + wrapper reuse)
         uses: gradle/actions/setup-gradle@v6
-
-      # Verification gates the artifact upload: any test or lint error fails the
-      # job before packaging. Both unit-test variants exist because
-      # android.onlyEnableUnitTestForTheTestedBuildType=false (gradle.properties).
-      # No secret is provided to this step.
-      - name: Verify (JVM unit tests + lint)
-        run: ./gradlew testDebugUnitTest testReleaseUnitTest lintDebug
 
       # Reconstruct the keystore under the runner's temp directory with
       # restrictive permissions. The keystore path is generated here - the
