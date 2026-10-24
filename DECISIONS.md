@@ -8135,4 +8135,23 @@ and superseded in place with bracketed markers rather than rewritten.
 
 **Scope exclusions.** No Git operations, no push/upload/publish, no Phase 14/15 work, no navigation refactor, no uninstall or data reset on the device, no test removed or weakened, no timeout raised. Only `AppNavHost.kt` (AQR-140) and the four named test files changed on the production/test side, plus the two fixture helpers they require.
 
+## 166. Output-validation parity: the §29 predicate stays `exists AND size > 0`; stricter `isFile()` rejection DEFERRED (2026-10-24)
+
+**Context.** The Linux CI run of the merged-PR verification job failed exactly one JVM test - `EpisodeOutputVerifierRuleTest > "a directory where a file was expected is not an output"` (`AssertionError` at the old L135). Root cause: the test hard-coded the WINDOWS outcome of the §29 output predicate. `EpisodeOutputVerifier.isPresent` implements the Python reference rule verbatim (`downloader.py:60`: `if out.exists() and out.stat().st_size > 0:`) as `output.exists() && output.length() > 0L`. Java specifies no particular `File.length()` result for a DIRECTORY: it is 0 on Windows (so the old assertion passed on the local dev machine for the whole project history) and > 0 on Linux/Android filesystems (so the same assertion failed on the Linux CI runner). The Python reference exhibits the identical platform split (`Path.stat().st_size` for a directory is 0 on Windows, > 0 on POSIX), so the production verifier is in parity with the reference on both platforms - the failing expectation was a Windows-only artifact, not a production defect.
+
+**Decisions.**
+
+1. **The predicate is unchanged.** `EpisodeOutputVerifier` keeps `output.exists() && output.length() > 0L` - the byte-for-byte §29 rule from `downloader.py:60`. No production line was touched.
+2. **The TEST expectation was corrected, not the code (test-only fix, 2026-10-24).** The directory case now pins the rule the reference actually specifies: the verdict for ANY path equals `exists AND size > 0` with no path-type special case (test `a directory is judged by the same exists-and-size rule, never trusted outright`). The corrected assertion is platform-portable and still fails if production ever special-cases directories or silently switches the rule to `isFile`.
+3. **No claim of universal directory rejection.** The current implementation does NOT guarantee that a directory is rejected as an output: on Linux/Android a directory at `outputPath` satisfies the rule exactly as the Python reference would. The state is not reachable through normal app flow (`outputPath` is always an app-constructed `<dir>/<file>.mp4`), and the Python reference never guarded it either.
+4. **Stricter validation (`isFile() && length() > 0`) is DEFERRED - not implemented, not scheduled, not mandatory.** It would reject directories categorically, but it DIVERGES from `downloader.py:60` (which has no `is_file()` check) and would change §29 reconciliation behaviour (a row whose `outputPath` is a directory would be demoted to missing where the reference says "already exists"). If the owner adopts it later, it must ship as an INTENTIONAL parity divergence in one coordinated change: production predicate + test expectations + PARITY/LIMITATIONS documentation updated together.
+
+**Evidence (2026-10-24).**
+- Windows host probe (JVM): directory `exists=true isDirectory=true length()=0` → rule `false` → the old test passed locally; full local workflow green (debug 1248 / release 1243, 0F/0E/0S, `lintDebug` 0 errors).
+- Linux CI evidence: the failed `assertFalse` at the old L135 proves production returned `true` for the directory on the runner (directory stat size > 0).
+- Python reference: `src/pahebatcher/downloader.py:60` - no `is_file()` check.
+- Post-fix local workflow (`testDebugUnitTest testReleaseUnitTest lintDebug`): exit 0; debug 115 suites / 1248 tests / 0F / 0E / 0S; release 114 / 1243 / 0F / 0E / 0S; fresh XML shows the renamed test PASSED in both variants.
+
+**Scope exclusions.** Documentation-only entry: no production source, test source, Gradle, dependency, signing, or release change in this cycle; no Git operations.
+
 [Back to Index](Index.md)
