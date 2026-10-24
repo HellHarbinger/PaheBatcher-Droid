@@ -65,3 +65,5 @@ proxies.txt
 #   gradle/wrapper/gradle-wrapper.jar  - no blanket *.jar rule is used
 #   .opencode/                          - owner-approved public agent config
 #   signing.env.example                 - documented dummy placeholders
+
+scripts/
