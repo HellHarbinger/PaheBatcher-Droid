@@ -663,62 +663,113 @@ jobs:
       # drop the per-job checksum files so only release assets remain.
       - name: Verify the handoff and the signing identity
         shell: bash
+        env:
+          APK_SIGNER: ${{ needs.build-apks.outputs.signer_digest }}
+          AAB_SIGNER: ${{ needs.build-aab.outputs.signer_digest }}
         run: |
           set -euo pipefail
 
-          if [[ ! -f dist/apk-checksums.txt || ! -f dist/aab-checksums.txt ]]; then
-            echo "::error::Handoff checksum files are missing - refusing to publish."
+          echo "::group::Release handoff diagnostics"
+          echo "Repository: ${GITHUB_REPOSITORY}"
+          echo "Run ID: ${GITHUB_RUN_ID}"
+          echo "Run attempt: ${GITHUB_RUN_ATTEMPT}"
+          echo "Commit: ${GITHUB_SHA}"
+          echo "Working directory: ${PWD}"
+
+          if [[ ! -d dist ]]; then
+            echo "::error::The dist directory is missing."
             exit 1
           fi
 
-          if ! (cd dist && sha256sum -c apk-checksums.txt); then
-            echo "::error::APK handoff failed checksum verification."
+          echo "Files received in dist (name and size):"
+          find dist -maxdepth 1 -type f \
+            -printf '%f (%s bytes)\n' | sort
+
+          echo "Checking for unsigned APK/AAB files..."
+          mapfile -t unsigned_files < <(
+            find dist -maxdepth 1 -type f \
+              \( -name '*-unsigned.apk' -o -name '*-unsigned.aab' \) \
+              -printf '%f\n' | sort
+          )
+
+          if [[ ${#unsigned_files[@]} -gt 0 ]]; then
+            printf 'Unsigned binary candidate: %s\n' "${unsigned_files[@]}"
+            echo "::error::Unsigned APK/AAB detected. Refusing to publish."
             exit 1
           fi
 
-          if ! (cd dist && sha256sum -c aab-checksums.txt); then
-            echo "::error::AAB handoff failed checksum verification."
-            exit 1
-          fi
+          echo "No unsigned APK/AAB filenames detected."
+          echo "::endgroup::"
 
+          echo "::group::Handoff checksum verification"
+          for checksum_file in apk-checksums.txt aab-checksums.txt; do
+            if [[ ! -s "dist/${checksum_file}" ]]; then
+              echo "::error::Missing or empty checksum file: ${checksum_file}"
+              exit 1
+            fi
+            echo "Checksum manifest: ${checksum_file}"
+            cat "dist/${checksum_file}"
+          done
+
+          echo "Verifying APK checksums..."
+          (cd dist && sha256sum --check apk-checksums.txt)
+
+          echo "Verifying AAB checksums..."
+          (cd dist && sha256sum --check aab-checksums.txt)
+          echo "All handoff checksums passed."
+          echo "::endgroup::"
+
+          echo "::group::Signing identity verification"
           hex64='^[0-9a-f]{64}$'
-          apk_signer="$(printf '%s' '${{ needs.build-apks.outputs.signer_digest }}' |
+
+          apk_signer="$(printf '%s' "$APK_SIGNER" |
             tr -d ':' | tr '[:upper:]' '[:lower:]')"
-          aab_signer="$(printf '%s' '${{ needs.build-aab.outputs.signer_digest }}' |
+          aab_signer="$(printf '%s' "$AAB_SIGNER" |
             tr -d ':' | tr '[:upper:]' '[:lower:]')"
 
-          if [[ -z "$apk_signer" ]] || ! printf '%s' "$apk_signer" | grep -Eq "$hex64"; then
-            echo "::error::APK signer digest is not a valid 64-hex fingerprint."
+          if [[ ! "$apk_signer" =~ $hex64 ]]; then
+            echo "::error::APK signer digest is missing or is not a valid SHA-256 fingerprint."
+            echo "Received APK digest length: ${#apk_signer}"
             exit 1
           fi
 
-          # This is the ONE authoritative APK <-> AAB signer comparison:
-          # both builds run in parallel, so neither could compare earlier.
-          if [[ -z "$aab_signer" ]] || ! printf '%s' "$aab_signer" | grep -Eq "$hex64"; then
-            echo "::error::AAB signer digest is not a valid 64-hex fingerprint."
+          if [[ ! "$aab_signer" =~ $hex64 ]]; then
+            echo "::error::AAB signer digest is missing or is not a valid SHA-256 fingerprint."
+            echo "Received AAB digest length: ${#aab_signer}"
             exit 1
           fi
 
-          if [[ "$aab_signer" != "$apk_signer" ]]; then
-            echo "::error::APK and AAB signer certificates do not match - refusing to publish."
+          if [[ "$apk_signer" != "$aab_signer" ]]; then
+            echo "::error::APK and AAB signer fingerprints do not match."
             exit 1
           fi
 
+          echo "Both signer fingerprints are valid and match."
+          echo "::endgroup::"
+
+          echo "::group::Release payload validation"
           shopt -s nullglob
           apks=(dist/*.apk)
           aabs=(dist/*.aab)
+
+          echo "APK count: ${#apks[@]}"
+          echo "AAB count: ${#aabs[@]}"
+
           if [[ ${#apks[@]} -ne 2 || ${#aabs[@]} -ne 1 ]]; then
-            echo "::error::Expected exactly 2 APKs and 1 AAB in the handoff; got ${#apks[@]} APK(s), ${#aabs[@]} AAB(s)."
+            echo "::error::Expected exactly 2 APKs and 1 AAB."
+            echo "Actual files:"
+            find dist -maxdepth 1 -type f -printf '%f\n' | sort
             exit 1
           fi
 
-          if ls dist/*-unsigned.* 2>/dev/null | grep -q .; then
-            echo "::error::Unsigned artifact reached the release payload - refusing to publish."
-            exit 1
-          fi
+          echo "Validated release binaries:"
+          printf '  APK: %s\n' "${apks[@]##*/}"
+          printf '  AAB: %s\n' "${aabs[@]##*/}"
 
           rm -f dist/apk-checksums.txt dist/aab-checksums.txt
-          echo "Handoff verified; signer identity matches across all binaries."
+          echo "Temporary handoff checksum manifests removed."
+          echo "Handoff validation passed; safe to continue to release metadata."
+          echo "::endgroup::"
 
       - name: Prepare release metadata and checksums
         id: metadata
