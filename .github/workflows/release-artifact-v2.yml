@@ -51,38 +51,20 @@
 #     publish finishes - succeeded, failed or skipped - and holds exactly
 #     one permission: actions: write.
 #
-# Temporary storage (what exists, and who deletes it):
-#   * TWO different things consume Actions cache storage here, and only
-#     one of them is release-temporary:
-#       1. Handoff caches: pb-release-{apks,aab}-<run_id>-<run_attempt>,
-#          written with actions/cache/save in the build jobs and read back
-#          with actions/cache/restore in publish, so the verified binaries
-#          move between jobs. actions/upload-artifact and
-#          actions/download-artifact are NOT used anywhere. These are run-
-#          scoped TEMPORARY storage and are deleted by the cleanup job.
-#       2. Gradle dependency cache: managed by gradle/actions/setup-gradle,
-#          a SEPARATE reusable cache keyed on Gradle/dependency state. The
-#          handoff cleanup does NOT delete it (deleting the two handoff
-#          keys removes only the handoff). Per setup-gradle's own docs it
-#          only WRITES from the default branch, so these pull_request runs
-#          read it but never write it; it is deliberately retained for
-#          build speed and outlives the release by design.
-#   * Cleanup ownership: the cleanup job is the ONLY place that deletes
-#     caches. Build jobs hold NO write permission and publish holds only
-#     contents: write, so nothing in the build/publish path can race with
-#     a restore or fail for lack of deletion rights; a failed or skipped
-#     publish still ends with zero orphaned handoff storage because cleanup
-#     needs: publish + always(). Deletion is idempotent: a missing key is
-#     reported as a warning, never as an error.
-#   * Note: GitHub Actions minutes AND artifact/cache storage are FREE for
-#     public repositories (docs.github.com/billing). This cleanup is applied
-#     as hygiene and to stay correct if the repository is ever transferred
-#     private, where plan storage quotas apply.
+# Temporary storage:
+#   * Verified release binaries move between jobs as run-scoped Actions
+#     artifacts named pb-release-{apks,aab}-<run_id>-<run_attempt>.
+#     They are uploaded after local signature/checksum verification,
+#     downloaded only by publish, and deleted by cleanup immediately after
+#     publish finishes, including failed/skipped publish runs.
+#   * The Gradle dependency cache is separate and remains reusable.
+#   * Cleanup also clears matching legacy handoff cache keys left by older
+#     workflow versions. Missing entries/API failures are warnings.
+#   * One-day artifact retention is a fallback if explicit deletion fails.
 #
 # Publication:
-#   * publish holds exactly `contents: write` (create the release) and the
-#     cleanup job exactly `actions: write` (delete handoff caches); every
-#     other job runs read-only (workflow-level contents: read).
+#   * publish holds `contents: write`; cleanup holds `actions: write` to
+#     delete temporary artifacts and legacy handoff caches.
 #   * Publication is SERIALIZED per repository by a job-level concurrency
 #     group (release-publish-<repo>, cancel-in-progress: false). The
 #     workflow-level group is keyed on the PR number and cannot stop two
@@ -397,13 +379,14 @@ jobs:
 
           echo "signer_digest=$reference_digest" >> "$GITHUB_OUTPUT"
 
-      # Verified binaries move to the publishing job via cache (NOT
-      # actions/upload-artifact). Keyed to this run + attempt only.
-      - name: Save verified APKs for the publishing job
-        uses: actions/cache/save@v6
+      # Upload only locally verified APKs and checksums; cleanup deletes it.
+      - name: Upload verified APKs for the publishing job
+        uses: actions/upload-artifact@v4
         with:
-          path: dist
-          key: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
 
       # Unconditional: the keystore is deleted even when any earlier step
       # fails. Nothing here is uploaded or cached.
@@ -604,13 +587,14 @@ jobs:
           echo "signer_digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Verified $name (integrity OK, signer fingerprint valid 64-hex, ABIs arm64-v8a+x86_64; compared with APK signer in publish)"
 
-      # Verified AAB moves to the publishing job via cache (NOT
-      # actions/upload-artifact). Keyed to this run + attempt only.
-      - name: Save verified AAB for the publishing job
-        uses: actions/cache/save@v6
+      # Upload only locally verified AAB and checksums; cleanup deletes it.
+      - name: Upload verified AAB for the publishing job
+        uses: actions/upload-artifact@v4
         with:
-          path: dist
-          key: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
 
       # Unconditional: the keystore is deleted even when any earlier step
       # fails. Nothing here is uploaded or cached.
@@ -625,7 +609,7 @@ jobs:
   # unless all three gates AND both builds succeeded.
   #
   # Receives NO signing secret: only the built-in GITHUB_TOKEN (GH_TOKEN).
-  # It does NOT delete caches - the cleanup job owns that exclusively.
+  # It does NOT delete temporary artifacts/caches - cleanup owns that.
   # ---------------------------------------------------------------------------
   publish:
     name: Publish GitHub Release
@@ -662,22 +646,18 @@ jobs:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
-      # fail-on-cache-miss: a missing handoff is a hard failure - never an
-      # empty or partial release. Both restore into dist/, whose file names
-      # are disjoint (2 APKs + 1 AAB + distinct checksum files).
-      - name: Restore verified APKs
-        uses: actions/cache/restore@v6
+      # A missing handoff is a hard failure, never an empty/partial release.
+      - name: Download verified APKs
+        uses: actions/download-artifact@v4
         with:
+          name: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
-          key: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
-          fail-on-cache-miss: true
 
-      - name: Restore verified AAB
-        uses: actions/cache/restore@v6
+      - name: Download verified AAB
+        uses: actions/download-artifact@v4
         with:
+          name: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
-          key: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
-          fail-on-cache-miss: true
 
       # Re-verify the handoff byte-for-byte and the signer identity, then
       # drop the per-job checksum files so only release assets remain.
@@ -837,34 +817,17 @@ jobs:
   # ---------------------------------------------------------------------------
   # CLEANUP - the SINGLE owner of temporary-storage deletion.
   #
-  #   * needs: publish + `if: always() && merged` => this job runs after
-  #     publish has finished whether it SUCCEEDED, FAILED or was SKIPPED
-  #     (publish is skipped whenever an upstream gate or build fails), so
-  #     no run can leave an orphaned handoff cache behind.
-  #   * needs: lists EVERY job explicitly (publish plus all five of
-  #     publish's own dependencies). Depending only on `needs: publish`
-  #     would assume GitHub defers a SKIPPED publish until its dependencies
-  #     finish, which is not documented: cleanup could otherwise start while
-  #     a still-running build saves its handoff AFTER cleanup ran. With the
-  #     full list, cleanup cannot start until every gate and both builds are
-  #     terminal. If you add a job to this workflow, add it here too.
-  #   * It runs AFTER publish, never during it, so deletion can never race
-  #     against actions/cache/restore.
-  #   * Holds exactly `actions: write` - the only job that has it. Build
-  #     jobs hold no write permission at all, and publish holds only
-  #     `contents: write`, so cache deletion is impossible anywhere else.
-  #   * No checkout, no build toolchain, no secret: only the built-in
-  #     GITHUB_TOKEN (needs actions:write for the cache DELETE API).
-  #   * Deletion is idempotent: DELETE-by-key on a key that no longer
-  #     exists is reported as a warning and never changes this job's
-  #     result, so cleanup can neither mask a real failure nor be masked
-  #     by one. GitHub's own cache eviction remains the backstop.
-  #   * Only the two run-scoped handoff keys are deleted. The reusable
-  #     Gradle dependency cache managed by setup-gradle is a different,
-  #     deliberately retained cache and is not touched here.
+  #   * Cleanup waits for every job and runs after publish is terminal, so
+  #     it cannot race with artifact upload/download.
+  #   * Deletes this run's two temporary artifacts, then clears matching
+  #     legacy handoff cache keys. Gradle dependency cache is retained.
+  #   * Holds actions: write for artifact/cache API cleanup; no checkout,
+  #     build toolchain or signing secrets.
+  #   * Missing entries/API errors are warnings. One-day artifact retention
+  #     is the fallback if explicit deletion fails.
   # ---------------------------------------------------------------------------
   cleanup:
-    name: Delete temporary handoff caches
+    name: Delete temporary handoff storage
     if: always() && github.event.pull_request.merged == true
     needs:
       - debug-unit-tests
@@ -877,20 +840,15 @@ jobs:
     timeout-minutes: 10
 
     permissions:
-      actions: write    # delete this run's temporary handoff caches ONLY
+      actions: write    # delete artifacts and legacy handoff caches
 
     env:
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      # DELETE-by-key returns HTTP 200 with a JSON body whose total_count
-      # may be 0 when no entry matched, so an HTTP success ALONE must never
-      # be reported as "deleted". The body is parsed to report the actual
-      # number of matching entries; a failed request (network/auth/API) is
-      # a warning, never an error, so cleanup can neither mask a real
-      # failure nor be masked by one. jq is preinstalled on GitHub-hosted
-      # Ubuntu runners.
-      - name: Delete this run's handoff caches
+      # Delete this run's artifacts first, then clear matching legacy cache
+      # keys. API failures are warnings so cleanup cannot mask the real job.
+      - name: Delete this run's handoff artifacts and clear handoff caches
         shell: bash
         env:
           APKS_KEY: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
@@ -898,19 +856,30 @@ jobs:
         run: |
           set -uo pipefail
 
+          if artifact_ids="$(gh api --paginate --jq '.artifacts[] | select(.name | startswith("pb-release-apks-") or startswith("pb-release-aab-")) | .id' "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" 2>&1)"; then
+            while IFS= read -r artifact_id; do
+              [[ -n "$artifact_id" ]] || continue
+              if gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" >/dev/null 2>&1; then
+                echo "Deleted temporary artifact id ${artifact_id}."
+              else
+                echo "::warning::Could not delete artifact id ${artifact_id}; one-day retention is fallback."
+              fi
+            done <<< "$artifact_ids"
+          else
+            echo "::warning::Could not list this run's artifacts: ${artifact_ids}"
+          fi
+
           for key in "$APKS_KEY" "$AAB_KEY"; do
             if response="$(gh api --method DELETE \
               "repos/${GITHUB_REPOSITORY}/actions/caches?key=${key}" 2>&1)"; then
               count="$(printf '%s' "$response" | jq -r '.total_count // empty')"
-
               if [[ "$count" =~ ^[0-9]+$ ]]; then
-                echo "Cache entries deleted for ${key}: ${count}"
+                echo "Legacy cache entries deleted for ${key}: ${count}"
               else
-                echo "::warning::Deletion request succeeded for ${key}, but its response could not be interpreted."
+                echo "::warning::Cache deletion request succeeded for ${key}, but response was not interpretable."
               fi
             else
-              echo "::warning::Cache deletion request failed for ${key}: ${response}"
+              echo "::warning::Legacy cache deletion failed for ${key}: ${response}"
             fi
           done
-
-          echo "Cleanup pass finished for run ${GITHUB_RUN_ID}."
+          echo "Temporary storage cleanup finished for run ${GITHUB_RUN_ID}."
