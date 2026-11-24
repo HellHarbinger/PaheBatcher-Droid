@@ -613,7 +613,7 @@ notification prefs) are read fresh at each decision point.
 | applicationId / namespace | `com.pahebatcher.app` |
 | compileSdk / targetSdk | 37 |
 | minSdk | 32 |
-| versionCode / versionName | 1 / `0.1.0` |
+| versionCode / versionName | 2 / `0.2.0` |
 | JVM toolchain | 25 (`jvmToolchain(25)`); compileOptions Java 17 |
 | Build types | `debug` (default) + `release` (`isMinifyEnabled = false`) |
 | Room | `exportSchema = true`, schemas in `pahebatcher/schemas/` |

@@ -15,17 +15,17 @@ Companion documents: `ANDROID_ARCHITECTURE.md`, `ANDROID_DATA_AND_STATE.md`,
 
 | Component | Version | Evidence |
 |---|---|---|
-| JDK (Gradle toolchain) | 25 | `pahebatcher/build.gradle.kts:49` — `kotlin { jvmToolchain(25) }` |
+| JDK (Gradle toolchain) | 25 | `pahebatcher/build.gradle.kts:152-154` — `kotlin { jvmToolchain(25) }` |
 | Gradle | 9.8.2 (wrapper) | `gradle/wrapper/gradle-wrapper.properties:4` — `gradle-9.8.2-bin.zip` |
 | Android Gradle Plugin | 9.4.1 | `gradle/libs.versions.toml:2` |
 | Kotlin | 2.4.20 | `gradle/libs.versions.toml:3` |
 | KSP | 2.3.12 | `gradle/libs.versions.toml:87` |
-| compileSdk | 37 | `pahebatcher/build.gradle.kts:10` |
-| targetSdk | 37 | `pahebatcher/build.gradle.kts:15` |
-| minSdk | 32 | `pahebatcher/build.gradle.kts:14` |
-| applicationId / namespace | `com.pahebatcher.app` | `pahebatcher/build.gradle.kts:9` |
-| versionCode / versionName | 1 / 0.1.0 | `pahebatcher/build.gradle.kts:16-17` |
-| Instrumentation runner | `androidx.test.runner.AndroidJUnitRunner` | `pahebatcher/build.gradle.kts:19` |
+| compileSdk | 37 | `pahebatcher/build.gradle.kts:61` |
+| targetSdk | 37 | `pahebatcher/build.gradle.kts:66` |
+| minSdk | 32 | `pahebatcher/build.gradle.kts:65` |
+| applicationId / namespace | `com.pahebatcher.app` | `pahebatcher/build.gradle.kts:64` (applicationId), `:60` (namespace) |
+| versionCode / versionName | 2 / 0.2.0 | `pahebatcher/build.gradle.kts:67-68` (defaults; CI may override via `-PappVersionCode`/`-PappVersionName`) |
+| Instrumentation runner | `androidx.test.runner.AndroidJUnitRunner` | `pahebatcher/build.gradle.kts:70` |
 
 Key library lines (from `gradle/libs.versions.toml`): Compose BOM 2026.08.00, Room 2.8.5,
 DataStore 1.2.1, Coroutines 1.11.0, OkHttp 4.12.0, FFmpegKit (maintained fork) 8.1.7,
@@ -316,15 +316,15 @@ failed), **NOT RUN** (not attempted — say why), or **NOT APPLICABLE**.
 
 ## 10. Citation checker
 
-`scripts/check-doc-citations.ps1` mechanically validates the repository's documentation
+`scripts/check-doc-citations.ps1` mechanically validated the repository's documentation
 anchors (table integrity, `FILE:NNNN` citation resolution, required content, frozen-evidence
-identity). Run it after ANY documentation edit:
+identity). **Removed from the repository on 2026-10-24; restored locally on 2026-11-14** — `scripts/` remains gitignored, so the script exists on this machine but is not in the repository or on GitHub (a fresh clone cannot run it); validate documentation edits manually in a fresh clone. The command and run records below are the historical, dated state:
 
 ```
 powershell -ExecutionPolicy Bypass -File scripts\check-doc-citations.ps1
 ```
 
-It must report `PASS` (exit 0). **Status as of 2026-10-18 (latest run this session):** the
+It reported `PASS` (exit 0). **Status as of 2026-10-18 (latest run this session):** the
 script exits 1 with ONE pre-existing failure, which is not in this document set:
 
 - `DECISIONS.md:3754` cites `AnimeDetailsViewModel.kt:362`, which is blank
@@ -388,14 +388,14 @@ If a verification step seems to require one of these, stop, report the blocker, 
 A debug build may be called release-ready only when ALL of the following hold, each with
 evidence per §11:
 
-1. Full JVM suite green (`testDebugUnitTest --rerun-tasks`, 109 suites / 1,189 tests, 0 failures/0 errors).
+1. Full JVM suite green (`testDebugUnitTest --rerun-tasks`, 115 suites / 1,248 tests as of 2026-10-24, 0 failures/0 errors).
 2. `lintDebug` — 0 errors.
 3. `assembleDebug` — BUILD SUCCESSFUL; APK SHA-256 recorded.
 4. Instrumented suites green via **direct `am instrument`** (§5.2) on the Android Dev user —
    one class per invocation, `OK (N tests)` quoted per class.
 5. The 24-step journey (§9) executed and every step classified.
 6. Documentation reconciled (feature catalog statuses match the evidence actually collected).
-7. `scripts/check-doc-citations.ps1` passing, or its then-current failures explicitly listed
+7. Documentation citations verified (with `scripts/check-doc-citations.ps1` when locally available — it is gitignored, not in the repository or on GitHub, restored locally 2026-11-14; see §10 — or manually from a fresh clone), or any then-current failures explicitly listed
    as pre-existing, outside this document set, with owners named (see §10).
 8. APK deployed per `AGENTS.md` §20 to every `device`-state target with `--user <id>`, and
    installation verified on each.

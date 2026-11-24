@@ -2229,4 +2229,4 @@ This section closes ONLY the run-ownership race-fix task (DECISIONS 164). It clo
 
 Scope boundary (documented, not hidden): the progress flusher (`updateProgress`, `EpisodeDownloadDao.kt:140`) and `updateTotalSegments` (`EpisodeDownloadDao.kt:612`) remain outside the ownership guard by design - a stale run may still land progress/total fields, never state or ownership (DECISIONS 164 bullet 6, LIMITATIONS 4). Phase 14 and Phase 15 were NOT started by this task.
 
-[Back to Index](Index.md)
+[Back to Index](README.md)

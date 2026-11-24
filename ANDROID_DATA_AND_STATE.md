@@ -22,7 +22,7 @@ Companion handoff documents:
 
 | Store | What lives there | Survives |
 |---|---|---|
-| **Room** (`pahebatcher.db`, `PaheDatabase`, **version 4**, `exportSchema = true`) | download sessions, episode downloads, watchlist, scan cache, playback positions | process death, restart, reboot |
+| **Room** (`pahebatcher.db`, `PaheDatabase`, **version 5**, `exportSchema = true`) | download sessions, episode downloads, watchlist, scan cache, playback positions | process death, restart, reboot |
 | **WorkManager** | one `OneTimeWorkRequest` per episode (`episode_download_<episodeId>`), the periodic watchlist request (`watchlist_periodic_check`) | process death, restart |
 | **DataStore** (`pahebatcher_settings`, `AppConfig`) | all settings (see §10) | process death, restart |
 | **App-private filesystem** (`filesDir/downloads/<episodeId>/`) | segment cache, staged/replacement files, pre-export assembled MP4 (`outputPath`) | until cleaned by export/cleanup/delete actions |
@@ -39,7 +39,7 @@ No destructive migrations exist; no `fallbackToDestructiveMigration`.
 | Entity (table) | PK | Key columns | Notes |
 |---|---|---|---|
 | `DownloadSessionEntity` (`download_sessions`) | `sessionId` | `title`, `animeSession`, `host`, `quality`, `audioLang`, `outputDir`, `cacheDir`, `createdAt`, `updatedAt`, `state` | States: `CREATED`, `DOWNLOADING`, `PAUSED`, `COMPLETED`, `FAILED` (companion constants). `title` is the single persisted title source for the export directory (Gate A). |
-| `EpisodeDownloadEntity` (`episode_downloads`) | `episodeId` | `sessionId` (FK), `episodeNumber: Float`, `episodeSession`, `title`, `fansub`, `audio`, `playUrl`, `totalSegments`, `completedSegments`, `downloadedBytes`, `state`, `speed`, `etaSeconds`, `retryCount`, `errorMessage`, `outputPath`, `m3u8Url`, `userAgent`, `referer`, `segmentDir`, `outputUri`, `replaceRequested`, `replacePriorUri`, `createdAt`, `updatedAt` | Full state machine in §4. `playUrl` is the durable re-resolution source; `m3u8Url`/`userAgent`/`referer` are the resolved-stream hand-off (cleared by `beginRetry`). |
+| `EpisodeDownloadEntity` (`episode_downloads`) | `episodeId` | `sessionId` (FK), `episodeNumber: Float`, `episodeSession`, `title`, `fansub`, `audio`, `playUrl`, `totalSegments`, `completedSegments`, `downloadedBytes`, `state`, `speed`, `etaSeconds`, `retryCount`, `errorMessage`, `outputPath`, `m3u8Url`, `userAgent`, `referer`, `segmentDir`, `outputUri`, `replaceRequested`, `replacePriorUri`, `createdAt`, `updatedAt`, `downloadRunId` (NULL for pre-v5 rows) | Full state machine in §4. `playUrl` is the durable re-resolution source; `m3u8Url`/`userAgent`/`referer` are the resolved-stream hand-off (cleared by `beginRetry`). `downloadRunId` (added in the v4→v5 migration) is the run-ownership guard on state transitions. |
 | `WatchlistEntity` (`watchlist`) | `sessionId` | `url`, `animeSession`, `host`, `title`, `quality`, `audioLang`, `outputDir`, `maxParallel`, `hlsWorkers`, `keepTemp`, `autoRetry`, `addedAt`, `lastCheckedAt`, `downloadedEpisodesJson` | `audioLang = "any"` (`AUDIO_ANY`) for new entries; concrete codes are used strictly. `isStale(cacheTtlMinutes)` compares `lastCheckedAt`. |
 | `ScanCacheEntity` (`scan_cache`) | `session` | `title`, `host`, `totalEpisodes`, `episodesJson`, `cachedAt`, `cacheTtlMinutes` (default 60) | `isExpired()` = now > `cachedAt + ttl`. See §9. |
 | `PlaybackPositionEntity` (`playback_position`) | `episodeId` | `positionMs`, `durationMs`, `updatedAt` | No FK (deliberate, additive v3 migration); no TTL, no eviction in v1. |
@@ -325,6 +325,7 @@ switching a SAF tree never resurrects a FAILED row.
 | **1 → 2** | Drops the unused `segments` table; adds nullable `m3u8Url`, `userAgent`, `referer`, `segmentDir` to `episode_downloads` (background-download support). |
 | **2 → 3** | Adds nullable `outputUri` to `episode_downloads` (MediaStore export reference; `outputPath` retained as the local/pre-export source of truth); creates the `playback_position` table. |
 | **3 → 4** | Adds `replaceRequested INTEGER NOT NULL DEFAULT 0` and `replacePriorUri TEXT` to `episode_downloads` (Replace-file intent + prior-export reference). Existing rows read as "no replacement". |
+| **4 → 5** | Adds nullable `downloadRunId TEXT` to `episode_downloads` (persisted run-ownership identity guarding run-owned state transitions; pre-upgrade rows read NULL = "owned by nobody"). |
 
 All additive; explicit migrations only (no destructive fallback).
 
