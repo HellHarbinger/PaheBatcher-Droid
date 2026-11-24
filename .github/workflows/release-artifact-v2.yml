@@ -1,83 +1,151 @@
 # Signed Android release: builds, verifies and PUBLISHES release assets to a
-# GitHub Release when a pull request is merged into `main`.
+# GitHub Release when a PR merges into `main`; owner-only workflow_dispatch
+# supports testing workflow changes safely.
 #
-# Trigger contract (unchanged):
-#   * pull_request types:[closed] + branches:[main] + job-level
-#     `if: github.event.pull_request.merged == true` on EVERY job.
-#   * A PR closed WITHOUT merging builds, signs and publishes nothing.
+# Trigger contract:
+#   * pull_request types:[closed] + branches:[main]; EVERY job additionally
+#     requires github.event.pull_request.merged == true in its guard, so a PR
+#     closed WITHOUT merging publishes nothing. No push trigger, no
+#     pull_request_target.
+#   * Version-sync PRs NEVER release: head branch chore/version-sync-* (made
+#     by this workflow's version-sync job) is excluded whether merged or not -
+#     resolve-run sets should_release=false AND every release-capable job's
+#     guard independently rejects it (startsWith on the head branch). Manual
+#     runs are never subject to this exclusion.
+#   * Merged FORK PRs fail closed: GitHub withholds repository secrets and
+#     read-restricts GITHUB_TOKEN on fork pull_request events even after
+#     merge, so those runs stop at the build jobs; HellHarbinger then triggers
+#     an owner-only workflow_dispatch on `main` to publish.
 #   * Every checkout pins github.event.pull_request.merge_commit_sha
 #     (fallback github.sha) - never PR-head code.
-#   * NO push trigger, NO workflow_dispatch, NO pull_request_target.
 #
-# Signing contract:
-#   * Four repository secrets: PB_KEYSTORE_BASE64, PB_KEYSTORE_PASSWORD,
-#     PB_KEY_ALIAS, PB_KEY_PASSWORD. All four are validated fail-closed
-#     BEFORE the build; only secret NAMES are ever echoed and shell tracing
-#     is never enabled around secret handling.
-#   * The keystore is decoded into RUNNER_TEMP (umask 077, chmod 600),
-#     validated with keytool -list, and passed to Gradle as
-#     PB_KEYSTORE_PATH: ${{ runner.temp }}/pb-release.keystore - a literal
-#     path, never read back from $GITHUB_ENV.
-#   * Keystore cleanup is unconditional (`if: always()`), including after
-#     failed builds. The keystore is never uploaded, cached or published.
-#   * Gradle success alone is never trusted: signatures are re-verified with
-#     apksigner (APKs) and jarsigner/keytool (AAB) after the build.
+# Manual-run contract (fail closed, idempotent): authorized means ref ==
+# refs/heads/main AND actor == triggering_actor == HellHarbinger, enforced
+# first by resolve-run and re-checked in every release-capable job's guard.
+# Before building, resolve-run compares the checked-out main commit with the
+# source commit recorded in the latest release's build-metadata.json:
+#   * SHAs match, or differ only in NON-source paths -> successful no-op
+#     (no artifacts, no version bump, no sync commit/PR, no tag, no release;
+#     downstream jobs skip through the explicit should_release output).
+#   * SHAs differ with source changes -> full release pipeline.
+# Missing/malformed metadata, a non-full SHA or any API/network failure
+# FAILS SAFE - never assumed released, never silently published.
 #
-# Fingerprint extraction (bug fixed):
-#   * `keytool -printcert -jarfile` on the JDK 25 runner labels the
-#     certificate fingerprint `SHA256:` (no dash) and INDENTS it. The
-#     previous anchored `awk '/^SHA-256:/'` therefore matched nothing,
-#     yielding an empty digest and a guaranteed false failure.
-#   * Both jobs now match `SHA-256:` AND `SHA256:` at any indent/case,
-#     normalise to bare lowercase hex, and VALIDATE the result as exactly
-#     64 hex characters before any comparison. An empty or malformed
-#     extraction fails loudly with its own message rather than comparing
-#     "" against a real digest.
+# Source-code change scope (manual no-op diff only) - a changed path counts
+# as SOURCE unless it is one of:
+#   * .github/**                 - CI/workflow definitions (this file)
+#   * *.md in any directory      - documentation (incl. .opencode/)
+#   * .gitignore, LICENSE, signing.env.example
+#   * version-sync-only edits to pahebatcher/build.gradle.kts (diff whose
+#     only +/- lines are `versionCode =` / `versionName =`)
+# Everything else verified against this repo's layout (pahebatcher/**,
+# build.gradle.kts, settings.gradle.kts, gradle.properties, gradle/**,
+# gradlew*) is source; unknown future paths conservatively count as source
+# so a release can never be suppressed by an unrecognized path. The workflow
+# file's own timestamp is NEVER used. Under .opencode/ only *.md is excluded
+# - a NON-Markdown file added there counts as source (conservative).
+#
+# Release metadata: build-metadata.json records `commit` = FULL 40-hex SHA
+# of the source commit checked out and built (never the later version-sync
+# commit); pre-existing fields unchanged. publish cross-checks it 4-way
+# against resolve-run and both build jobs before creating the release.
+#
+# Version resolution - exactly ONE collision retry, never a search loop:
+#   * candidate #1 = versionName in pahebatcher/build.gradle.kts; if tag
+#     v<c1> is taken the patch component is incremented EXACTLY once ->
+#     candidate #2; if v<c2> is also taken the job FAILS (v<c3> never tried).
+#     Only a genuine HTTP 404 means "tag absent" - auth, permission,
+#     rate-limit, network and server errors are NEVER a missing tag.
+#     versionCode increments only on the patch bump, independent of the probe.
+#   * Fail-closed validation BEFORE any output: versionName matches
+#     ^[0-9A-Za-z][0-9A-Za-z._+-]*$ AND passes git check-ref-format for
+#     refs/tags/v<ver> and refs/heads/chore/version-sync-<ver>; versionCode
+#     is an integer in 1..2100000000 (guards run BEFORE arithmetic; 10#
+#     defeats octal misreads). Build jobs re-validate at their own boundary
+#     and receive values ONLY through env - a GitHub expression is never
+#     interpolated into `run:` shell source (quote/metacharacter injection).
+#
+# Signing & artifact integrity:
+#   * Four secrets (PB_KEYSTORE_BASE64/PASSWORD, PB_KEY_ALIAS/PASSWORD)
+#     validated fail-closed BEFORE the build; only secret NAMES are echoed,
+#     tracing never enabled around secrets. The keystore is decoded into
+#     RUNNER_TEMP (umask 077, chmod 600, whitespace-tolerant Base64),
+#     validated by ONE `keytool -list -v -storepass:env` call (password never
+#     on argv), passed to Gradle as a literal ${{ runner.temp }} path (never
+#     read from $GITHUB_ENV), deleted unconditionally - never uploaded/cached.
+#   * Gradle success alone is NEVER trusted: signer fingerprint (validated
+#     as 64-hex), single-signer exclusivity, ABI packaging, checksums and
+#     APK manifest badging (non-debuggable, matching versionName,
+#     non-regressed versionCode, consistent applicationId) are verified
+#     locally in each build job and INDEPENDENTLY re-verified in publish on
+#     the DOWNLOADED bytes. The AAB gate is ENTRY-LEVEL (every payload entry
+#     signature-verified, no second signer) - rationale documented at the gate.
+#   * BUG FIXED: JDK 25 keytool labels the fingerprint `SHA256:` (no dash) and
+#     indents it, so the old anchored `/^SHA-256:/` awk matched nothing and
+#     produced an empty digest (guaranteed false failures). Both spellings are
+#     matched at any indent/case before normalisation to exactly 64 hex.
+#   * Each build job exports ONLY that validated fingerprint as its
+#     `keystore_fingerprint` output - never a secret. publish compares APK
+#     signer, AAB signer and BOTH keystore fingerprints (which must also
+#     agree with each other); build-job outputs are cross-checked but never
+#     trusted as sole proof. Exact 2-APK/1-AAB count and checksums stay
+#     enforced; ANY failure stops the job before release creation.
 #
 # Job structure:
-#   * THREE independent verification jobs (testDebugUnitTest,
-#     testReleaseUnitTest, lintDebug) gate BOTH build jobs, so each check is
-#     a separate status and can be re-run on its own.
-#   * build-apks and build-aab depend ONLY on those three gates, so the two
-#     builds run IN PARALLEL - a release build takes the longer of the two
-#     builds, not their sum. Each build validates its OWN signer
-#     fingerprint as 64-hex; the single APK <-> AAB signer comparison
-#     happens in publish, the one place that holds BOTH digests and the
-#     last gate before release creation.
-#   * publish `needs:` ALL five jobs, so an AAB failure blocks the release -
-#     there is deliberately no APK-only publish path.
-#   * A separate `cleanup` job (`if: always() && merged`, needs: EVERY other
-#     job) is the ONE owner of temporary-storage deletion. It runs after
-#     publish finishes - succeeded, failed or skipped - and holds exactly
-#     one permission: actions: write.
+#   * resolve-run is FIRST: authorizes (fail closed for manual dispatch)
+#     and decides publish vs. no-op via `should_release`.
+#   * THREE independent gates (testDebugUnitTest, testReleaseUnitTest,
+#     lintDebug) gate BOTH builds - each a separate, re-runnable status.
+#     The builds depend ONLY on those gates (+ resolve-version), so they run
+#     IN PARALLEL; publish `needs:` ALL six jobs, so an AAB failure blocks
+#     the release - there is deliberately no APK-only publish path.
+#   * version-sync runs ONLY after successful publish (one idempotent
+#     commit/PR); its failure never undoes the published release.
+#   * cleanup (`if: always() && release guard`) is the ONE owner of
+#     temporary-artifact deletion: waits on the producer/consumer chain,
+#     holds exactly actions: write, never runs for no-op/unauthorized/
+#     unmerged runs (nothing to delete).
 #
-# Temporary storage:
-#   * Verified release binaries move between jobs as run-scoped Actions
-#     artifacts named pb-release-{apks,aab}-<run_id>-<run_attempt>.
-#     They are uploaded after local signature/checksum verification,
-#     downloaded only by publish, and deleted by cleanup immediately after
-#     publish finishes, including failed/skipped publish runs.
-#   * The Gradle dependency cache is separate and remains reusable.
-#   * Cleanup also clears matching legacy handoff cache keys left by older
-#     workflow versions. Missing entries/API failures are warnings.
-#   * One-day artifact retention is a fallback if explicit deletion fails.
+# Supply chain & runtime: all actions pinned to immutable 40-char SHAs on
+# Node 24 (upload-artifact v7.0.2, download-artifact v8.0.2, enforced server-side
+# digest checks); jobs pinned to ubuntu-24.04 (no drift during the Ubuntu 26.04
+# rollout); Gradle wrapper validated via validate-wrappers: true; dependency
+# caches READ-ONLY for fork PRs (no cache poisoning of trusted runs).
 #
-# Publication:
-#   * publish holds `contents: write`; cleanup holds `actions: write` to
-#     delete temporary artifacts and legacy handoff caches.
-#   * Publication is SERIALIZED per repository by a job-level concurrency
-#     group (release-publish-<repo>, cancel-in-progress: false). The
-#     workflow-level group is keyed on the PR number and cannot stop two
-#     DIFFERENT merged PRs racing for the same tag; with this group the
-#     second publish queues, and the preflight tag/release probe makes it
-#     fail safely rather than overwrite the first release.
-#   * Authenticated with the built-in GITHUB_TOKEN via GH_TOKEN - no PAT.
-#   * Tag v<versionName>, target = the merged commit. If the tag OR the
-#     release already exists the job FAILS SAFELY: no overwrite, no moving a
-#     tag, no replacing existing assets.
-#   * Published assets: the 2 APKs, the AAB, SHA256SUMS.txt,
-#     build-metadata.json. Never the keystore, .investigation/, .scratch/
-#     or local configuration.
+# Temporary storage: verified binaries move as run-scoped artifacts
+# pb-release-{apks,aab}-<run_id>-<run_attempt> - uploaded after local
+# verification, downloaded only by publish, deleted by cleanup right after
+# publish (including failed/skipped runs). This workflow creates NO handoff
+# caches; the Gradle dependency cache is separate and retained. Missing
+# entries/API failures are warnings; one-day retention is the fallback.
+#
+# Publication: publish holds contents: write; version-sync contents: write +
+# pull-requests: write; cleanup actions: write; everything else runs under
+# the workflow-level permissions: contents: read (build jobs need no
+# actions: write - artifact transfer uses the runtime token). Publication is
+# SERIALIZED per repository by publish's job-level concurrency group
+# (release-publish-<repo>, cancel-in-progress: false): the workflow-level
+# group only stops two runs of the SAME PR, so a second merged PR queues
+# here and its preflight tag/release probe fails safely instead of
+# overwriting. GitHub keeps ONE pending job per group - a queued run can be
+# superseded (re-run safe: an existing tag/release is never overwritten). A
+# superseded PENDING publish never ran, so it created no tag, no release and
+# no assets; recovery is a later manual workflow_dispatch of this workflow
+# (owner-only, refs/heads/main). That dispatch must still pass the normal
+# release-eligibility checks (resolve-run's decision plus the publish job's
+# guards) before the same preflight approves it - approval additionally
+# requires that neither the tag nor the release exists. Ordering inside a
+# concurrency group is NOT guaranteed FIFO and is never relied upon here.
+# Auth: built-in GITHUB_TOKEN via GH_TOKEN (no PAT needed to publish).
+# Version-sync authenticates raw git EXPLICITLY (persist-credentials: false;
+# gh CLI does not auth raw git) via a github.com-scoped Authorization header
+# written ONLY into local git config - see the version-sync step.
+# Tagging: tag = v<versionName>, target = the merged/checked-out commit. If
+# the tag OR the release already exists the job FAILS SAFELY (no overwrite,
+# no tag move, no asset replacement). Published assets: 2 APKs, AAB,
+# SHA256SUMS.txt, build-metadata.json - never the keystore or local
+# configuration. Version synchronization runs AFTER publication, so a sync
+# failure can never undo or misrepresent a published release.
 
 name: Signed Android Release
 
@@ -85,167 +153,616 @@ on:
   pull_request:
     types: [closed]
     branches: [main]
+  # Owner-only manual testing; fail-closed (main + HellHarbinger checks in
+  # resolve-run and every release-capable guard) - see the header contract.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# Keyed per PR (manual runs key on run id); publish's job-level group below
+# serializes actual publication across different PRs.
 concurrency:
-  group: release-pr-${{ github.event.pull_request.number }}
+  group: release-pr-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Three INDEPENDENT verification gates. No job here receives a secret.
-  # Each runs the identical toolchain so the checks are comparable.
+  # RESOLVE + AUTHORIZE - FIRST job of every run: the automatic merged-PR path
+  # is authorized by the merged==true guard; the manual path FAILS CLOSED unless
+  # ref is refs/heads/main and actor/triggering_actor are HellHarbinger, then
+  # decides publish vs. no-op (should_release). Full history (fetch-depth: 0)
+  # for the released-source diff. Holds only contents: read.
   # ---------------------------------------------------------------------------
+  resolve-run:
+    name: Resolve and authorize run
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      should_release: ${{ steps.decide.outputs.should_release }}
+      current_sha: ${{ steps.decide.outputs.current_sha }}
+    steps:
+      - name: Checkout source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Authorize the run (fail closed)
+        id: authorize
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_ACTOR: ${{ github.actor }}
+          EVENT_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          failed=0
+          if [[ "$EVENT_REF" != "refs/heads/main" ]]; then
+            echo "::error::Manual dispatch refused: it must run on refs/heads/main (got ${EVENT_REF})."
+            failed=1
+          fi
+          if [[ "$EVENT_ACTOR" != "HellHarbinger" ]]; then
+            echo "::error::Manual dispatch refused: github.actor must be HellHarbinger (got ${EVENT_ACTOR})."
+            failed=1
+          fi
+          if [[ "$EVENT_TRIGGERING_ACTOR" != "HellHarbinger" ]]; then
+            echo "::error::Manual dispatch refused: github.triggering_actor must be HellHarbinger (got ${EVENT_TRIGGERING_ACTOR})."
+            failed=1
+          fi
+          if [[ "$failed" -ne 0 ]]; then
+            echo "::error::Manual dispatch authorization failed. No version resolution, build, tag or release was attempted."
+            exit 1
+          fi
+
+          echo "Manual dispatch authorized (refs/heads/main, HellHarbinger)."
+          echo "authorized=true" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether this run publishes anything
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT_SHA="$(git rev-parse HEAD)"
+          if [[ ! "$CURRENT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not determine the full 40-hex SHA of the checked-out source commit."
+            exit 1
+          fi
+
+          SHOULD_RELEASE="true"
+          REASON=""
+          RELEASED_SHA=""
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if [[ "$HEAD_REF" == chore/version-sync-* ]]; then
+              # Version-sync PRs (chore/version-sync-*) NEVER release - header contract.
+              SHOULD_RELEASE="false"
+              REASON="Version-sync pull request from branch '${HEAD_REF}' is excluded from the release pipeline (branch convention chore/version-sync-*); closing it, merged or not, builds, tags and releases nothing."
+            else
+              REASON="Automatic merged-PR release for source commit ${CURRENT_SHA}."
+            fi
+          else
+            echo "::group::Manual no-op detection"
+            echo "Current main source commit: ${CURRENT_SHA}"
+
+            RELEASE_API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
+            if ! http_code="$(curl -sS --connect-timeout 15 --max-time 60 \
+                --retry 3 --retry-delay 2 --retry-connrefused \
+                -o "${RUNNER_TEMP}/latest-release.json" -w '%{http_code}' \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$RELEASE_API")"; then
+              echo "::error::Network failure while querying the latest GitHub release. Fail-safe: the last released source commit cannot be established; refusing to publish."
+              exit 1
+            fi
+
+            case "$http_code" in
+              200) ;;
+              404)
+                echo "::error::No published GitHub release exists, so build-metadata.json with the last released source commit is unavailable. Fail-safe: refusing to publish without reliable release metadata."
+                exit 1 ;;
+              *)
+                echo "::error::GitHub releases API returned HTTP ${http_code}. Fail-safe: an API failure is never treated as proof about release state; refusing to publish."
+                exit 1 ;;
+            esac
+
+            if ! asset_url="$(jq -er '.assets[] | select(.name == "build-metadata.json") | .url' "${RUNNER_TEMP}/latest-release.json")"; then
+              echo "::error::The latest release has no readable build-metadata.json asset. Fail-safe: refusing to publish on unreliable release metadata."
+              exit 1
+            fi
+
+            if ! curl -sSfL --connect-timeout 15 --max-time 60 \
+                --retry 3 --retry-delay 2 --retry-connrefused \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/octet-stream" \
+                -o "${RUNNER_TEMP}/build-metadata.json" \
+                "$asset_url"; then
+              echo "::error::Failed to download build-metadata.json from the latest release. Fail-safe: refusing to publish."
+              exit 1
+            fi
+
+            if ! RELEASED_SHA="$(jq -er '.commit' "${RUNNER_TEMP}/build-metadata.json" 2>/dev/null)"; then
+              echo "::error::Latest release build-metadata.json is malformed or has no readable 'commit' field. Fail-safe: refusing to publish on unreliable release metadata."
+              exit 1
+            fi
+            if [[ ! "$RELEASED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Latest release build-metadata.json 'commit' is not a full 40-hex source SHA (got: '${RELEASED_SHA}'). Fail-safe: refusing to publish."
+              exit 1
+            fi
+
+            echo "Last released source commit: ${RELEASED_SHA}"
+
+            if [[ "$RELEASED_SHA" == "$CURRENT_SHA" ]]; then
+              SHOULD_RELEASE="false"
+              REASON="The checked-out main commit is exactly the source commit of the latest release; nothing is unreleased."
+            else
+              if ! git cat-file -e "${RELEASED_SHA}^{commit}" 2>/dev/null; then
+                echo "::error::Released source commit ${RELEASED_SHA} is not present in this repository's history, so unreleased changes cannot be classified. Fail-safe: refusing to publish."
+                exit 1
+              fi
+
+              # ---- explicit source-code change scope (see header) ----
+              is_excluded_change() {
+                local f="$1"
+                case "$f" in
+                  # Only *.md is excluded under .opencode/; non-Markdown there counts as source.
+                  .github/* | *.md | .gitignore | LICENSE | signing.env.example)
+                    return 0 ;;
+                esac
+                if [[ "$f" == "pahebatcher/build.gradle.kts" ]]; then
+                  local remaining
+                  remaining="$(git diff "$RELEASED_SHA" "$CURRENT_SHA" -- "$f" |
+                    grep -E '^[+-]' |
+                    grep -vE '^(\+\+\+|---)' |
+                    grep -vE '^[+-][[:space:]]*(versionCode|versionName)[[:space:]]*=' ||
+                    true)"
+                  if [[ -z "$remaining" ]]; then
+                    return 0
+                  fi
+                fi
+                return 1
+              }
+
+              # NUL-delimited to a temp file so a git diff failure aborts
+              # immediately under set -e instead of yielding an empty list.
+              git -c core.quotePath=false diff -z --name-only "$RELEASED_SHA" "$CURRENT_SHA" \
+                > "${RUNNER_TEMP}/changed-paths.z"
+
+              source_files=()
+              other_files=()
+              while IFS= read -r -d '' changed_path; do
+                [[ -n "$changed_path" ]] || continue
+                if is_excluded_change "$changed_path"; then
+                  other_files+=("$changed_path")
+                else
+                  source_files+=("$changed_path")
+                fi
+              done < "${RUNNER_TEMP}/changed-paths.z"
+
+              if [[ ${#source_files[@]} -gt 0 ]]; then
+                SHOULD_RELEASE="true"
+                REASON="${#source_files[@]} unreleased source-code file(s) changed since released commit ${RELEASED_SHA}."
+                echo "Unreleased source-code changes:"
+                printf '  %s\n' "${source_files[@]}"
+              else
+                SHOULD_RELEASE="false"
+                REASON="No unreleased source-code changes since ${RELEASED_SHA}; only non-source changes were found (${#other_files[@]} file(s): workflows/docs/metadata/version-sync)."
+                echo "Only non-source changes since the last release:"
+                if [[ ${#other_files[@]} -gt 0 ]]; then
+                  printf '  %s\n' "${other_files[@]}"
+                else
+                  echo "  (no file differences)"
+                fi
+              fi
+            fi
+            echo "::endgroup::"
+          fi
+
+          {
+            echo "## Release run decision"
+            echo ""
+            echo "- Event: \`${EVENT_NAME}\`"
+            echo "- Current source commit: \`${CURRENT_SHA}\`"
+            if [[ -n "$RELEASED_SHA" ]]; then
+              echo "- Last released source commit: \`${RELEASED_SHA}\`"
+            fi
+            echo "- Publish: \`${SHOULD_RELEASE}\`"
+            echo "- Reason: ${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$SHOULD_RELEASE" == "false" ]]; then
+            echo "::notice::Workflow completed without publishing. ${REASON}"
+          else
+            echo "Proceeding with the release pipeline. ${REASON}"
+          fi
+
+          echo "should_release=${SHOULD_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+          echo "current_sha=${CURRENT_SHA}" >> "$GITHUB_OUTPUT"
+
+  # Three INDEPENDENT verification gates; identical toolchain; no secrets.
   debug-unit-tests:
     name: Debug unit tests
-    if: github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
+    if: >-
+      success() &&
+      needs.resolve-run.outputs.should_release == 'true' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        !startsWith(github.event.pull_request.head.ref, 'chore/version-sync-')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor == 'HellHarbinger' &&
+        github.triggering_actor == 'HellHarbinger'))
+    needs: [resolve-run]
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout merged commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
-      - name: Validate Gradle wrapper
-        uses: gradle/actions/wrapper-validation@v6
-
       - name: Set up JDK 25
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '25'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           accept-android-sdk-licenses: true
           packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
 
-      - name: Set up Gradle (caching + wrapper reuse)
-        uses: gradle/actions/setup-gradle@v6
+      - name: Set up Gradle (wrapper validation + caching)
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          validate-wrappers: true
+          cache-read-only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
 
       - name: Run debug unit tests
         run: ./gradlew testDebugUnitTest
 
   release-unit-tests:
     name: Release unit tests
-    if: github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
+    if: >-
+      success() &&
+      needs.resolve-run.outputs.should_release == 'true' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        !startsWith(github.event.pull_request.head.ref, 'chore/version-sync-')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor == 'HellHarbinger' &&
+        github.triggering_actor == 'HellHarbinger'))
+    needs: [resolve-run]
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout merged commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
-      - name: Validate Gradle wrapper
-        uses: gradle/actions/wrapper-validation@v6
-
       - name: Set up JDK 25
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '25'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           accept-android-sdk-licenses: true
           packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
 
-      - name: Set up Gradle (caching + wrapper reuse)
-        uses: gradle/actions/setup-gradle@v6
+      - name: Set up Gradle (wrapper validation + caching)
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          validate-wrappers: true
+          cache-read-only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
 
       - name: Run release unit tests
         run: ./gradlew testReleaseUnitTest
 
   debug-lint:
     name: Debug lint
-    if: github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
+    if: >-
+      success() &&
+      needs.resolve-run.outputs.should_release == 'true' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        !startsWith(github.event.pull_request.head.ref, 'chore/version-sync-')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor == 'HellHarbinger' &&
+        github.triggering_actor == 'HellHarbinger'))
+    needs: [resolve-run]
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout merged commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
-      - name: Validate Gradle wrapper
-        uses: gradle/actions/wrapper-validation@v6
-
       - name: Set up JDK 25
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '25'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           accept-android-sdk-licenses: true
           packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
 
-      - name: Set up Gradle (caching + wrapper reuse)
-        uses: gradle/actions/setup-gradle@v6
+      - name: Set up Gradle (wrapper validation + caching)
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          validate-wrappers: true
+          cache-read-only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
 
       - name: Run debug lint
         run: ./gradlew lintDebug
 
   # ---------------------------------------------------------------------------
-  # Build + verify the two per-ABI release APKs. One of only two jobs that
-  # see signing secrets. Exports the verified signer digest for publish to
-  # compare against the AAB's digest (the builds run in parallel).
+  # Dynamic version resolution: probe tag v<versionName> with REAL HTTP status
+  # codes (only 404 = absent); ONE patch bump then FAIL - see header contract.
   # ---------------------------------------------------------------------------
-  build-apks:
-    name: Build and verify signed APKs
-    if: github.event.pull_request.merged == true
-    needs: [debug-unit-tests, release-unit-tests, debug-lint]
-    runs-on: ubuntu-latest
+  resolve-version:
+    name: Resolve release version
+    if: >-
+      success() &&
+      needs.resolve-run.outputs.should_release == 'true' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        !startsWith(github.event.pull_request.head.ref, 'chore/version-sync-')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor == 'HellHarbinger' &&
+        github.triggering_actor == 'HellHarbinger'))
+    needs: [resolve-run]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
-      actions: write
-    timeout-minutes: 60
     outputs:
-      signer_digest: ${{ steps.verify-apks.outputs.signer_digest }}
+      version_name: ${{ steps.version.outputs.version_name }}
+      version_code: ${{ steps.version.outputs.version_code }}
     steps:
       - name: Checkout merged commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
-      - name: Validate Gradle wrapper
-        uses: gradle/actions/wrapper-validation@v6
+      - name: Calculate target version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # versionName: take the LAST quoted string on the assignment line (both
+          # the plain and the version-sync gradle-property forms), else a bare token.
+          BASE_NAME="$(sed -n 's/.*versionName = .*"\([^"]*\)".*/\1/p' pahebatcher/build.gradle.kts | head -n 1)"
+          if [[ -z "$BASE_NAME" ]]; then
+            BASE_NAME="$(sed -n 's/.*versionName = \([a-zA-Z0-9._+-][a-zA-Z0-9._+-]*\).*/\1/p' pahebatcher/build.gradle.kts | head -n 1)"
+          fi
+
+          # versionCode: exact forms first (after `versionCode = `, else after the
+          # trailing `?: `) - a greedy pattern would read `versionCode = 12` as `2`.
+          BASE_CODE="$(sed -n 's/.*versionCode = \([0-9][0-9]*\).*/\1/p' pahebatcher/build.gradle.kts | head -n 1)"
+          if [[ -z "$BASE_CODE" ]]; then
+            BASE_CODE="$(sed -n '/versionCode/ s/.*?: \([0-9][0-9]*\).*/\1/p' pahebatcher/build.gradle.kts | head -n 1)"
+          fi
+
+          # An unreadable version FAILS - never release under a guessed version.
+          if [[ -z "$BASE_NAME" ]]; then
+            echo "::error::Could not read versionName from pahebatcher/build.gradle.kts; refusing to resolve a release version."
+            exit 1
+          fi
+          if [[ -z "$BASE_CODE" ]]; then
+            echo "::error::Could not read versionCode from pahebatcher/build.gradle.kts; refusing to resolve a release version."
+            exit 1
+          fi
+
+          # Validate BEFORE exposing any job output: the tag-safe pattern rejects shell
+          # metacharacters; build jobs re-check and receive values via env only.
+          if [[ ! "$BASE_NAME" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::versionName '${BASE_NAME}' read from pahebatcher/build.gradle.kts does not match ^[0-9A-Za-z][0-9A-Za-z._+-]*\$; refusing to resolve a release version."
+            exit 1
+          fi
+
+          # versionCode: positive integer in 1..2100000000; digit/length guards run BEFORE
+          # arithmetic (10# defeats octal misreads), before any tag probe.
+          if [[ ! "$BASE_CODE" =~ ^[0-9]+$ ]] || (( ${#BASE_CODE} > 10 )); then
+            echo "::error::versionCode '${BASE_CODE}' read from pahebatcher/build.gradle.kts is not a plain positive integer; refusing to resolve a release version."
+            exit 1
+          fi
+          if (( 10#$BASE_CODE < 1 || 10#$BASE_CODE > 2100000000 )); then
+            echo "::error::versionCode ${BASE_CODE} is outside the supported range 1..2100000000; refusing to resolve a release version."
+            exit 1
+          fi
+          BASE_CODE=$((10#$BASE_CODE))
+
+          # Only a genuine 404 means "tag absent" - any other status fails the job.
+          TAG_STATE="error"
+          probe_tag() {
+            local tag="$1" encoded_tag code
+            TAG_STATE="error"
+            encoded_tag="$(jq -rn --arg v "$tag" '$v|@uri')"
+            if ! code="$(curl -sS --connect-timeout 15 --max-time 60 \
+                --retry 3 --retry-delay 2 --retry-connrefused \
+                -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${encoded_tag}")"; then
+              echo "::error::Network failure while probing tag ${tag}. Refusing to guess tag existence."
+              return 0
+            fi
+            case "$code" in
+              200) TAG_STATE="exists" ;;
+              404) TAG_STATE="absent" ;;
+              *)
+                echo "::error::GitHub API returned HTTP ${code} while probing tag ${tag}. Refusing to treat an API failure as a missing tag."
+                TAG_STATE="error" ;;
+            esac
+          }
+
+          # Candidate #1: the developer-supplied versionName in the repository.
+          CANDIDATE_ONE="$BASE_NAME"
+          probe_tag "v${CANDIDATE_ONE}"
+
+          case "$TAG_STATE" in
+            absent)
+              echo "Tag v${CANDIDATE_ONE} does not exist. Using developer-supplied version."
+              TARGET_NAME="$CANDIDATE_ONE"
+              TARGET_CODE="$BASE_CODE"
+              IS_AUTO_BUMPED="false"
+              ;;
+            exists)
+              echo "Tag v${CANDIDATE_ONE} already exists on GitHub. Bumping the patch version exactly once."
+              if [[ "$CANDIDATE_ONE" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)$ ]]; then
+                MAJOR="${BASH_REMATCH[1]}"
+                MINOR="${BASH_REMATCH[2]}"
+                PATCH="${BASH_REMATCH[3]}"
+                EXTRA="${BASH_REMATCH[4]}"
+                NEXT_PATCH=$((10#$PATCH + 1))
+                CANDIDATE_TWO="${MAJOR}.${MINOR}.${NEXT_PATCH}${EXTRA}"
+              else
+                CANDIDATE_TWO="${CANDIDATE_ONE}.1"
+              fi
+
+              # Candidate #2: the ONLY retry; a taken second tag fails the job.
+              probe_tag "v${CANDIDATE_TWO}"
+              case "$TAG_STATE" in
+                absent)
+                  TARGET_NAME="$CANDIDATE_TWO"
+                  TARGET_CODE=$((BASE_CODE + 1))
+                  IS_AUTO_BUMPED="true"
+                  ;;
+                exists)
+                  echo "::error::Both v${CANDIDATE_ONE} and v${CANDIDATE_TWO} already exist. Refusing to skip further versions (no v-candidate-3 search). Investigate the gap between the latest released code and the code being deployed."
+                  exit 1
+                  ;;
+                error)
+                  exit 1
+                  ;;
+              esac
+              ;;
+            error)
+              exit 1
+              ;;
+          esac
+
+          echo "Resolved release versionName: $TARGET_NAME"
+          echo "Resolved release versionCode: $TARGET_CODE"
+
+          # Final validation before export; downstream jobs re-validate at their boundary.
+          if [[ ! "$TARGET_NAME" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]] ||
+             ! git check-ref-format "refs/tags/v${TARGET_NAME}" >/dev/null 2>&1 ||
+             ! git check-ref-format "refs/heads/chore/version-sync-${TARGET_NAME}" >/dev/null 2>&1; then
+            echo "::error::Resolved versionName '${TARGET_NAME}' does not match ^[0-9A-Za-z][0-9A-Za-z._+-]*\$ or produces an invalid Git tag/version-sync branch ref (e.g. '..', trailing '.', '.lock'); refusing to export it as a job output."
+            exit 1
+          fi
+          if [[ ! "$TARGET_CODE" =~ ^[0-9]+$ ]] || (( 10#$TARGET_CODE < 1 || 10#$TARGET_CODE > 2100000000 )); then
+            echo "::error::Resolved versionCode '${TARGET_CODE}' is not a positive integer in 1..2100000000; refusing to export it as a job output."
+            exit 1
+          fi
+
+          echo "version_name=$TARGET_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$TARGET_CODE" >> "$GITHUB_OUTPUT"
+          echo "is_auto_bumped=$IS_AUTO_BUMPED" >> "$GITHUB_OUTPUT"
+
+  # Build + verify the per-ABI release APKs (signing job 1 of 2, parallel with
+  # build-aab). Exports the verified signer digest for publish to compare.
+  build-apks:
+    name: Build and verify signed APKs
+    if: >-
+      success() &&
+      needs.resolve-run.outputs.should_release == 'true' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        !startsWith(github.event.pull_request.head.ref, 'chore/version-sync-')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor == 'HellHarbinger' &&
+        github.triggering_actor == 'HellHarbinger'))
+    needs: [resolve-run, debug-unit-tests, release-unit-tests, debug-lint, resolve-version]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    outputs:
+      signer_digest: ${{ steps.verify-apks.outputs.signer_digest }}
+      keystore_fingerprint: ${{ steps.prepare-keystore.outputs.keystore_fingerprint }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      # Source commit recorded so publish can prove what these binaries were built from.
+      - name: Record checked-out source commit
+        id: source
+        shell: bash
+        run: echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 25
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '25'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           accept-android-sdk-licenses: true
           packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
 
-      - name: Set up Gradle (caching + wrapper reuse)
-        uses: gradle/actions/setup-gradle@v6
+      - name: Set up Gradle (wrapper validation + caching)
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          validate-wrappers: true
+          cache-read-only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
 
-      # Fail-closed: all FOUR secrets validated before the build. Only names
-      # are echoed; no value is ever printed and tracing stays disabled.
+      # Fail-closed: all FOUR secrets validated first; only secret NAMES are echoed.
       - name: Validate signing secrets and prepare keystore
+        id: prepare-keystore
         env:
           KS_B64: ${{ secrets.PB_KEYSTORE_BASE64 }}
           KS_PASS: ${{ secrets.PB_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
           KEY_PASS: ${{ secrets.PB_KEY_PASSWORD }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -258,13 +775,16 @@ jobs:
 
           if [[ -n "$missing" ]]; then
             echo "::error::Missing signing secret(s):$missing"
+            if [[ "$EVENT_NAME" == "pull_request" && "$PR_HEAD_REPO" != "$GITHUB_REPOSITORY" ]]; then
+              echo "::notice::This merged pull request originated from a fork (${PR_HEAD_REPO:-unknown}). GitHub withholds repository secrets on fork pull_request events; trigger workflow_dispatch on main as HellHarbinger to publish."
+            fi
             exit 1
           fi
 
           umask 077
           KS_PATH="$RUNNER_TEMP/pb-release.keystore"
 
-          if ! printf '%s' "$KS_B64" | base64 --decode > "$KS_PATH"; then
+          if ! printf '%s' "$KS_B64" | tr -d '[:space:]' | base64 --decode > "$KS_PATH"; then
             echo "::error::Keystore secret is not valid Base64."
             rm -f "$KS_PATH"
             exit 1
@@ -278,14 +798,35 @@ jobs:
 
           chmod 600 "$KS_PATH"
 
-          if ! keytool -list \
+          # ONE call: -storepass:env keeps KS_PASS off argv (never /proc cmdline) and
+          # fails closed on a bad password OR alias; forced C/English for the parser.
+          set +e
+          ks_dump="$(LC_ALL=C keytool -J-Duser.language=en -J-Duser.country=US \
+            -list -v \
             -keystore "$KS_PATH" \
-            -storepass "$KS_PASS" \
-            -alias "$KEY_ALIAS" > /dev/null; then
-            echo "::error::Keystore validation failed. Check password and alias."
+            -storepass:env KS_PASS \
+            -alias "$KEY_ALIAS" 2>&1)"
+          ks_rc=$?
+          set -e
+          if [[ $ks_rc -ne 0 ]]; then
+            echo "::error::Keystore validation failed (keytool exit ${ks_rc}). Check password and alias."
+            printf '%s\n' "$ks_dump"
             rm -f "$KS_PATH"
             exit 1
           fi
+
+          KEYSTORE_FP="$(printf '%s\n' "$ks_dump" |
+            sed -n 's/^[[:space:]]*SHA-\{0,1\}256:[[:space:]]*\([0-9A-Fa-f:]*\).*/\1/p' |
+            head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+
+          if [[ ! "$KEYSTORE_FP" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not extract a valid 64-hex SHA-256 certificate fingerprint from the release keystore; refusing to build binaries whose signing identity cannot be proven."
+            rm -f "$KS_PATH"
+            exit 1
+          fi
+
+          echo "Release keystore certificate SHA-256 fingerprint: ${KEYSTORE_FP}"
+          echo "keystore_fingerprint=${KEYSTORE_FP}" >> "$GITHUB_OUTPUT"
 
       - name: Build signed APKs
         env:
@@ -293,17 +834,46 @@ jobs:
           PB_KEYSTORE_PASSWORD: ${{ secrets.PB_KEYSTORE_PASSWORD }}
           PB_KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
           PB_KEY_PASSWORD: ${{ secrets.PB_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease
+          # Passed via ENV, never interpolated into run: source (quote/metachar injection).
+          APP_VERSION_NAME: ${{ needs.resolve-version.outputs.version_name }}
+          APP_VERSION_CODE: ${{ needs.resolve-version.outputs.version_code }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Verify APK signatures and ABI contents
+          # Fail closed on missing/malformed resolve-version outputs (re-validation here).
+          if [[ ! "$APP_VERSION_NAME" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::Refusing to build: APP_VERSION_NAME is missing or does not match ^[0-9A-Za-z][0-9A-Za-z._+-]*\$."
+            exit 1
+          fi
+          if [[ ! "$APP_VERSION_CODE" =~ ^[0-9]+$ ]] || (( 10#$APP_VERSION_CODE < 1 || 10#$APP_VERSION_CODE > 2100000000 )); then
+            echo "::error::Refusing to build: APP_VERSION_CODE is missing or is not a positive integer in 1..2100000000."
+            exit 1
+          fi
+
+          ./gradlew assembleRelease \
+            -PappVersionName="$APP_VERSION_NAME" \
+            -PappVersionCode="$APP_VERSION_CODE"
+
+      - name: Verify APK signatures, manifest badging and ABI contents
         id: verify-apks
         shell: bash
+        env:
+          KEYSTORE_FP: ${{ steps.prepare-keystore.outputs.keystore_fingerprint }}
+          APP_VERSION_NAME: ${{ needs.resolve-version.outputs.version_name }}
+          APP_VERSION_CODE: ${{ needs.resolve-version.outputs.version_code }}
         run: |
           set -euo pipefail
 
           BT="$ANDROID_HOME/build-tools/36.0.0"
           APK_DIR="pahebatcher/build/outputs/apk/release"
           hex64='^[0-9a-f]{64}$'
+
+          # Fail closed on a missing/malformed keystore fingerprint output.
+          if [[ ! "$KEYSTORE_FP" =~ $hex64 ]]; then
+            echo "::error::Release keystore fingerprint output is missing or is not a valid 64-hex SHA-256 value; refusing to verify APKs."
+            exit 1
+          fi
 
           shopt -s nullglob
           apks=("$APK_DIR"/*.apk)
@@ -315,6 +885,7 @@ jobs:
 
           mkdir -p dist
           reference_digest=""
+          reference_pkg=""
           seen_abis=()
 
           for apk in "${apks[@]}"; do
@@ -335,6 +906,10 @@ jobs:
             fi
 
             cert="$("$BT/apksigner" verify --print-certs "$apk")"
+            if printf '%s\n' "$cert" | grep -q 'Signer #2'; then
+              echo "::error::$name: unexpected multiple signers detected by apksigner."
+              exit 1
+            fi
             digest="$(printf '%s\n' "$cert" |
               awk '/Signer #1 certificate SHA-256 digest/ {print $NF; exit}' |
               tr -d ':' | tr '[:upper:]' '[:lower:]')"
@@ -352,6 +927,51 @@ jobs:
               exit 1
             fi
 
+            # Every APK must be signed by the certificate INSIDE the release keystore.
+            if [[ "$digest" != "$KEYSTORE_FP" ]]; then
+              echo "::error::$name: APK signer fingerprint (${digest}) does not match the release keystore certificate (${KEYSTORE_FP})."
+              exit 1
+            fi
+
+            # Badging: non-debuggable, resolved versionName, no versionCode regression,
+            # one applicationId across ABIs.
+            if ! badging="$("$BT/aapt2" dump badging "$apk" 2>&1)"; then
+              echo "::error::${name}: aapt2 dump badging failed."
+              printf '%s\n' "$badging"
+              exit 1
+            fi
+            if printf '%s\n' "$badging" | grep -Eq '^application-debuggable([[:space:]]|$)'; then
+              echo "::error::${name}: APK has application-debuggable set; refusing to release a debuggable build."
+              exit 1
+            fi
+
+            pkg_line="$(printf '%s\n' "$badging" | grep -m 1 '^package:' || true)"
+            apk_pkg="$(printf '%s\n' "$pkg_line" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
+            apk_vcode="$(printf '%s\n' "$pkg_line" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")"
+            apk_vname="$(printf '%s\n' "$pkg_line" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")"
+
+            if [[ -z "$apk_pkg" ]]; then
+              echo "::error::${name}: could not extract applicationId from aapt2 dump badging."
+              exit 1
+            fi
+            if [[ -z "$reference_pkg" ]]; then
+              reference_pkg="$apk_pkg"
+            elif [[ "$apk_pkg" != "$reference_pkg" ]]; then
+              echo "::error::${name}: applicationId mismatch (${apk_pkg} vs ${reference_pkg})."
+              exit 1
+            fi
+            if [[ "$apk_vname" != "$APP_VERSION_NAME" ]]; then
+              echo "::error::${name}: embedded versionName '${apk_vname}' does not match resolved APP_VERSION_NAME '${APP_VERSION_NAME}'. Check that pahebatcher/build.gradle.kts honors -PappVersionName."
+              exit 1
+            fi
+            if [[ ! "$apk_vcode" =~ ^[0-9]+$ ]] || (( 10#$apk_vcode < 10#$APP_VERSION_CODE )); then
+              echo "::error::${name}: embedded versionCode '${apk_vcode}' is invalid or lower than resolved APP_VERSION_CODE '${APP_VERSION_CODE}'. Check that pahebatcher/build.gradle.kts honors -PappVersionCode."
+              exit 1
+            fi
+            if (( 10#$apk_vcode != 10#$APP_VERSION_CODE )); then
+              echo "::notice::${name}: embedded versionCode (${apk_vcode}) exceeds base APP_VERSION_CODE (${APP_VERSION_CODE}) - expected only if ABI split offsets are configured."
+            fi
+
             packaged_abis="$(unzip -Z1 "$apk" |
               sed -n 's#^lib/\([^/]*\)/.*#\1#p' | sort -u)"
 
@@ -362,7 +982,7 @@ jobs:
 
             seen_abis+=("$expected_abi")
             cp "$apk" dist/
-            echo "Verified $name (signer sha256 present, single ABI $expected_abi)"
+            echo "Verified $name (pkg=${apk_pkg}, versionName=${apk_vname}, versionCode=${apk_vcode}, non-debuggable, single signer matches keystore, ABI=${expected_abi})"
           done
 
           actual_abis="$(printf '%s\n' "${seen_abis[@]}" | sort -u)"
@@ -373,79 +993,90 @@ jobs:
             exit 1
           fi
 
-          # Checksums recorded over the verified binaries so the publish job
-          # can prove the handoff did not alter a single byte.
+          # Checksums over the verified binaries: publish proves the handoff unaltered.
           (cd dist && sha256sum ./*.apk > apk-checksums.txt)
 
           echo "signer_digest=$reference_digest" >> "$GITHUB_OUTPUT"
 
       # Upload only locally verified APKs and checksums; cleanup deletes it.
       - name: Upload verified APKs for the publishing job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/
           if-no-files-found: error
           retention-days: 1
 
-      # Unconditional: the keystore is deleted even when any earlier step
-      # fails. Nothing here is uploaded or cached.
+      # Unconditional: keystore deleted even after a failed build; never uploaded/cached.
       - name: Remove temporary keystore
         if: always()
         shell: bash
         run: rm -f "$RUNNER_TEMP/pb-release.keystore"
 
-  # ---------------------------------------------------------------------------
-  # Build + verify the AAB. Depends ONLY on the three verification gates, so
-  # it runs IN PARALLEL with build-apks (total build time = the longer of
-  # the two, not their sum). It validates its OWN signer fingerprint as
-  # 64-hex; the APK <-> AAB comparison happens in publish, which receives
-  # both digests.
-  # ---------------------------------------------------------------------------
+  # Build + verify the AAB (signing job 2 of 2, parallel with build-apks). Validates
+  # its OWN signer digest; the APK<->AAB comparison happens in publish.
   build-aab:
     name: Build and verify signed AAB
-    if: github.event.pull_request.merged == true
-    needs: [debug-unit-tests, release-unit-tests, debug-lint]
-    runs-on: ubuntu-latest
+    if: >-
+      success() &&
+      needs.resolve-run.outputs.should_release == 'true' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        !startsWith(github.event.pull_request.head.ref, 'chore/version-sync-')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor == 'HellHarbinger' &&
+        github.triggering_actor == 'HellHarbinger'))
+    needs: [resolve-run, debug-unit-tests, release-unit-tests, debug-lint, resolve-version]
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
-      actions: write
     timeout-minutes: 60
     outputs:
       signer_digest: ${{ steps.verify-aab.outputs.signer_digest }}
+      keystore_fingerprint: ${{ steps.prepare-keystore.outputs.keystore_fingerprint }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
     steps:
       - name: Checkout merged commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
-      - name: Validate Gradle wrapper
-        uses: gradle/actions/wrapper-validation@v6
+      # Source commit recorded so publish can prove what this binary was built from.
+      - name: Record checked-out source commit
+        id: source
+        shell: bash
+        run: echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 25
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '25'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           accept-android-sdk-licenses: true
           packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
 
-      - name: Set up Gradle (caching + wrapper reuse)
-        uses: gradle/actions/setup-gradle@v6
+      - name: Set up Gradle (wrapper validation + caching)
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          validate-wrappers: true
+          cache-read-only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
 
-      # Fail-closed: all FOUR secrets validated before the build. Only names
-      # are echoed; no value is ever printed and tracing stays disabled.
+      # Fail-closed: all FOUR secrets validated first; only secret NAMES are echoed.
       - name: Validate signing secrets and prepare keystore
+        id: prepare-keystore
         env:
           KS_B64: ${{ secrets.PB_KEYSTORE_BASE64 }}
           KS_PASS: ${{ secrets.PB_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
           KEY_PASS: ${{ secrets.PB_KEY_PASSWORD }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -458,13 +1089,16 @@ jobs:
 
           if [[ -n "$missing" ]]; then
             echo "::error::Missing signing secret(s):$missing"
+            if [[ "$EVENT_NAME" == "pull_request" && "$PR_HEAD_REPO" != "$GITHUB_REPOSITORY" ]]; then
+              echo "::notice::This merged pull request originated from a fork (${PR_HEAD_REPO:-unknown}). GitHub withholds repository secrets on fork pull_request events; trigger workflow_dispatch on main as HellHarbinger to publish."
+            fi
             exit 1
           fi
 
           umask 077
           KS_PATH="$RUNNER_TEMP/pb-release.keystore"
 
-          if ! printf '%s' "$KS_B64" | base64 --decode > "$KS_PATH"; then
+          if ! printf '%s' "$KS_B64" | tr -d '[:space:]' | base64 --decode > "$KS_PATH"; then
             echo "::error::Keystore secret is not valid Base64."
             rm -f "$KS_PATH"
             exit 1
@@ -478,14 +1112,35 @@ jobs:
 
           chmod 600 "$KS_PATH"
 
-          if ! keytool -list \
+          # ONE call: -storepass:env keeps KS_PASS off argv (never /proc cmdline) and
+          # fails closed on a bad password OR alias; forced C/English for the parser.
+          set +e
+          ks_dump="$(LC_ALL=C keytool -J-Duser.language=en -J-Duser.country=US \
+            -list -v \
             -keystore "$KS_PATH" \
-            -storepass "$KS_PASS" \
-            -alias "$KEY_ALIAS" > /dev/null; then
-            echo "::error::Keystore validation failed. Check password and alias."
+            -storepass:env KS_PASS \
+            -alias "$KEY_ALIAS" 2>&1)"
+          ks_rc=$?
+          set -e
+          if [[ $ks_rc -ne 0 ]]; then
+            echo "::error::Keystore validation failed (keytool exit ${ks_rc}). Check password and alias."
+            printf '%s\n' "$ks_dump"
             rm -f "$KS_PATH"
             exit 1
           fi
+
+          KEYSTORE_FP="$(printf '%s\n' "$ks_dump" |
+            sed -n 's/^[[:space:]]*SHA-\{0,1\}256:[[:space:]]*\([0-9A-Fa-f:]*\).*/\1/p' |
+            head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+
+          if [[ ! "$KEYSTORE_FP" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not extract a valid 64-hex SHA-256 certificate fingerprint from the release keystore; refusing to build binaries whose signing identity cannot be proven."
+            rm -f "$KS_PATH"
+            exit 1
+          fi
+
+          echo "Release keystore certificate SHA-256 fingerprint: ${KEYSTORE_FP}"
+          echo "keystore_fingerprint=${KEYSTORE_FP}" >> "$GITHUB_OUTPUT"
 
       - name: Build signed AAB
         env:
@@ -493,16 +1148,43 @@ jobs:
           PB_KEYSTORE_PASSWORD: ${{ secrets.PB_KEYSTORE_PASSWORD }}
           PB_KEY_ALIAS: ${{ secrets.PB_KEY_ALIAS }}
           PB_KEY_PASSWORD: ${{ secrets.PB_KEY_PASSWORD }}
-        run: ./gradlew bundleRelease
+          # Passed via ENV, never interpolated into run: source (quote/metachar injection).
+          APP_VERSION_NAME: ${{ needs.resolve-version.outputs.version_name }}
+          APP_VERSION_CODE: ${{ needs.resolve-version.outputs.version_code }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fail closed on missing/malformed resolve-version outputs (re-validation here).
+          if [[ ! "$APP_VERSION_NAME" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::Refusing to build: APP_VERSION_NAME is missing or does not match ^[0-9A-Za-z][0-9A-Za-z._+-]*\$."
+            exit 1
+          fi
+          if [[ ! "$APP_VERSION_CODE" =~ ^[0-9]+$ ]] || (( 10#$APP_VERSION_CODE < 1 || 10#$APP_VERSION_CODE > 2100000000 )); then
+            echo "::error::Refusing to build: APP_VERSION_CODE is missing or is not a positive integer in 1..2100000000."
+            exit 1
+          fi
+
+          ./gradlew bundleRelease \
+            -PappVersionName="$APP_VERSION_NAME" \
+            -PappVersionCode="$APP_VERSION_CODE"
 
       - name: Verify AAB signature, signer identity and ABI contents
         id: verify-aab
         shell: bash
+        env:
+          KEYSTORE_FP: ${{ steps.prepare-keystore.outputs.keystore_fingerprint }}
         run: |
           set -euo pipefail
 
           AAB_DIR="pahebatcher/build/outputs/bundle/release"
           hex64='^[0-9a-f]{64}$'
+
+          # Fail closed on a missing/malformed keystore fingerprint output.
+          if [[ ! "$KEYSTORE_FP" =~ $hex64 ]]; then
+            echo "::error::Release keystore fingerprint output is missing or is not a valid 64-hex SHA-256 value; refusing to verify the AAB."
+            exit 1
+          fi
 
           shopt -s nullglob
           aabs=("$AAB_DIR"/*.aab)
@@ -515,37 +1197,69 @@ jobs:
           aab="${aabs[0]}"
           name="$(basename "$aab")"
 
-          # --- INTEGRITY GATE: non-strict must exit 0; exit 1 = tamper. ---
-          # Full diagnostics are always echoed (never discarded).
+          # --- INTEGRITY + ENTRY-LEVEL SIGNATURE GATE ---
+          # `jarsigner -verify` alone exits 0 for PARTIALLY signed archives (only a
+          # warning), so this gate also requires EVERY payload entry (everything except
+          # directories + META-INF signature metadata) to carry the 's' verified flag;
+          # an unsigned archive or tampered entry fails. `-strict` is deliberately NOT
+          # used: it exits non-zero for the intentionally self-signed release cert - a
+          # trust-chain warning, not unsigned-entry detection.
           set +e
-          verify_out="$(jarsigner -verify "$aab" 2>&1)"
+          verify_out="$(LC_ALL=C jarsigner -J-Duser.language=en -J-Duser.country=US -verify -verbose "$aab" 2>&1)"
           js=$?
           set -e
           printf '%s\n' "$verify_out"
           if [[ $js -ne 0 ]]; then
-            echo "::error::$name: jarsigner -verify reported the AAB as NOT verified (exit ${js}) - integrity failure."
+            echo "::error::$name: jarsigner reported the AAB as NOT verified (exit ${js}) - integrity failure."
+            exit 1
+          fi
+          if printf '%s\n' "$verify_out" | grep -q '^jar is unsigned\.'; then
+            echo "::error::$name: jarsigner reports the AAB as UNSIGNED - entry-level signature verification failed."
             exit 1
           fi
 
-          # --- Strict diagnostics are INFORMATIONAL ONLY. ---
-          # The release certificate is intentionally self-signed, so -strict
-          # exits non-zero (4 on JDK 25) for an intact jar. Displayed for
-          # visibility; never used to reject a valid self-signed release.
-          set +e
-          strict_out="$(jarsigner -verify -strict "$aab" 2>&1)"
-          js_strict=$?
-          set -e
-          printf '%s\n' "$strict_out"
-          if [[ $js_strict -ne 0 ]]; then
-            echo "NOTE: jarsigner -verify -strict exited ${js_strict}; expected for the intentionally self-signed release certificate. The non-strict integrity gate above passed (exit 0)."
+          # Signed entries: verbose lines are "<flags> <size> <date> <name>"; a trailing
+          # CR is stripped first (jarsigner may emit CRLF, e.g. on Windows).
+          signed_entries="$(printf '%s\n' "$verify_out" | awk '
+            { sub(/\r$/, "") }
+            match($0, /^[ ]*[a-z?]*[ ]+[0-9][0-9]* [A-Za-z][A-Za-z][A-Za-z] [A-Za-z][A-Za-z][A-Za-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [^ ]+ [0-9][0-9][0-9][0-9] /) {
+              flags = substr($0, 1, RLENGTH)
+              sub(/ [0-9].*$/, "", flags)
+              if (flags ~ /s/) print substr($0, RLENGTH + 1)
+            }')"
+
+          # Payload entries straight from the archive, so an unlisted entry cannot slip through.
+          aab_entries="$(unzip -Z1 "$aab")"
+          if ! printf '%s\n' "$aab_entries" | grep -qx 'base/manifest/AndroidManifest.xml'; then
+            echo "::error::$name: missing base/manifest/AndroidManifest.xml - invalid App Bundle structure."
+            exit 1
           fi
 
-          # --- Signer fingerprint (self-check; cross-job compare in publish) ---
-          # keytool prints the fingerprint label as "SHA256:" (no dash) and
-          # indented, so BOTH spellings are matched at any indent/case, and
-          # the value must be exactly 64 hex characters before it is
-          # exported as this job's signer_digest for publish to compare
-          # against the APK signer digest.
+          payload_entries="$(printf '%s\n' "$aab_entries" | awk '
+            { sub(/\r$/, "") }
+            /\/$/ { next }
+            { lower = tolower($0) }
+            lower == "meta-inf/manifest.mf" { next }
+            lower ~ /^meta-inf\/[^\/]+\.(sf|rsa|dsa|ec)$/ { next }
+            lower ~ /^meta-inf\/sig-/ { next }
+            { print }')"
+          if [[ -z "$payload_entries" ]]; then
+            echo "::error::$name: the AAB exposes no payload entries to verify - refusing it."
+            exit 1
+          fi
+
+          unsigned_payload="$(comm -23 \
+            <(printf '%s\n' "$payload_entries" | sort -u) \
+            <(printf '%s\n' "$signed_entries" | sort -u))"
+          if [[ -n "$unsigned_payload" ]]; then
+            echo "::error::$name: the AAB contains UNSIGNED payload entries - a partially signed archive is never accepted:"
+            printf '%s\n' "$unsigned_payload" | sed 's/^/  unsigned: /'
+            exit 1
+          fi
+          echo "Entry-level signature check passed: every payload entry is signed (directories and META-INF signature metadata excluded by rule)."
+
+          # keytool labels the fingerprint "SHA256:" (no dash) and indents it: match both
+          # spellings at any indent/case, require exactly 64 hex before export.
           set +e
           cert_dump="$(keytool -printcert -jarfile "$aab" 2>&1)"
           kt=$?
@@ -553,6 +1267,10 @@ jobs:
           if [[ $kt -ne 0 ]]; then
             echo "::error::$name: keytool -printcert -jarfile failed (exit ${kt})."
             printf '%s\n' "$cert_dump"
+            exit 1
+          fi
+          if printf '%s\n' "$cert_dump" | grep -q 'Signer #2:'; then
+            echo "::error::$name: unexpected multiple signers detected in AAB."
             exit 1
           fi
 
@@ -566,9 +1284,13 @@ jobs:
             exit 1
           fi
 
-          # The APK signer comparison is intentionally NOT done here: this
-          # job no longer depends on build-apks, so publish performs the
-          # single authoritative comparison of both exported digests.
+          # A self-consistent digest is not proof - it must equal the release keystore cert.
+          if [[ "$digest" != "$KEYSTORE_FP" ]]; then
+            echo "::error::$name: AAB signer fingerprint (${digest}) does not match the release keystore certificate (${KEYSTORE_FP})."
+            exit 1
+          fi
+
+          # APK<->AAB digest comparison is intentionally done in publish (builds are parallel).
 
           # --- ABI packaging: exactly arm64-v8a + x86_64 (32-bit pruned). ---
           aab_abis="$(unzip -Z1 "$aab" |
@@ -585,50 +1307,55 @@ jobs:
           (cd dist && sha256sum ./*.aab > aab-checksums.txt)
 
           echo "signer_digest=$digest" >> "$GITHUB_OUTPUT"
-          echo "Verified $name (integrity OK, signer fingerprint valid 64-hex, ABIs arm64-v8a+x86_64; compared with APK signer in publish)"
+          echo "Verified $name (integrity OK, signer matches release keystore, ABIs arm64-v8a+x86_64; compared with APK signer in publish)"
 
       # Upload only locally verified AAB and checksums; cleanup deletes it.
       - name: Upload verified AAB for the publishing job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/
           if-no-files-found: error
           retention-days: 1
 
-      # Unconditional: the keystore is deleted even when any earlier step
-      # fails. Nothing here is uploaded or cached.
+      # Unconditional: keystore deleted even after a failed build; never uploaded/cached.
       - name: Remove temporary keystore
         if: always()
         shell: bash
         run: rm -f "$RUNNER_TEMP/pb-release.keystore"
 
   # ---------------------------------------------------------------------------
-  # PUBLISH - holds exactly `contents: write`, the only job that can create
-  # a release. `needs:` lists EVERY other job, so publication is impossible
-  # unless all three gates AND both builds succeeded.
-  #
-  # Receives NO signing secret: only the built-in GITHUB_TOKEN (GH_TOKEN).
-  # It does NOT delete temporary artifacts/caches - cleanup owns that.
+  # PUBLISH - the only job with `contents: write`; `needs:` ALL six preceding jobs.
+  # Receives NO signing secret; cleanup owns artifact deletion and version-sync
+  # owns version files (both run after us).
   # ---------------------------------------------------------------------------
   publish:
     name: Publish GitHub Release
-    if: github.event.pull_request.merged == true
-    needs: [debug-unit-tests, release-unit-tests, debug-lint, build-apks, build-aab]
-    runs-on: ubuntu-latest
+    if: >-
+      success() &&
+      needs.resolve-run.outputs.should_release == 'true' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        !startsWith(github.event.pull_request.head.ref, 'chore/version-sync-')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor == 'HellHarbinger' &&
+        github.triggering_actor == 'HellHarbinger'))
+    needs: [resolve-run, debug-unit-tests, release-unit-tests, debug-lint, build-apks, build-aab, resolve-version]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
-    # Serialize PUBLICATION across PRs. The workflow-level group is keyed
-    # on the PR number, so it only stops two runs of the SAME PR from
-    # overlapping - it does not stop two different merged PRs from racing to
-    # publish the same tag. This job-level group makes publish jobs queue
-    # per repository while gates and builds still run in parallel, and the
-    # tag/release preflight check then makes the second PR fail safely
-    # instead of overwriting the first release.
-    # Note: GitHub keeps only ONE pending job per group - a run queued
-    # behind a running publish can be superseded by a newer run (it shows
-    # as skipped and must be re-run manually; the preflight checks make a
-    # re-run safe because an existing tag/release is never overwritten).
+    # Serialize PUBLICATION per repository: the workflow-level group only stops two
+    # runs of the SAME PR, so this job-level group queues different merged PRs while
+    # gates/builds stay parallel; the preflight probe then makes the second run fail
+    # safely. GitHub keeps ONE pending job per group (a queued run can be superseded -
+    # re-run safe: an existing tag/release is never overwritten). A superseded PENDING
+    # publish never ran and therefore created no tag/release; recovering it means
+    # re-running this workflow (manual dispatch on main, owner-only) - that run
+    # must still pass the normal release-eligibility checks (resolve-run's
+    # decision plus this job's guards) before the preflight then clears it,
+    # which requires that neither object exists. Queue order is NOT
+    # guaranteed FIFO and is never relied upon. This concurrency block is unchanged.
     concurrency:
       group: release-publish-${{ github.repository }}
       cancel-in-progress: false
@@ -641,31 +1368,49 @@ jobs:
 
     steps:
       - name: Checkout merged commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
+      # apksigner (build-tools) + jarsigner/keytool (JDK) run HERE on the DOWNLOADED
+      # binaries - build-job outputs are never accepted as sole proof.
+      - name: Set up JDK 25
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+          packages: 'build-tools;36.0.0'
+
       # A missing handoff is a hard failure, never an empty/partial release.
       - name: Download verified APKs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
 
       - name: Download verified AAB
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
 
-      # Re-verify the handoff byte-for-byte and the signer identity, then
-      # drop the per-job checksum files so only release assets remain.
-      - name: Verify the handoff and the signing identity
+      # Re-verify the handoff byte-for-byte + signer identity, then drop checksum files.
+      - name: Verify the handoff, badging and signing identity
         shell: bash
         env:
           APK_SIGNER: ${{ needs.build-apks.outputs.signer_digest }}
           AAB_SIGNER: ${{ needs.build-aab.outputs.signer_digest }}
+          KS_FP_APKS: ${{ needs.build-apks.outputs.keystore_fingerprint }}
+          KS_FP_AAB: ${{ needs.build-aab.outputs.keystore_fingerprint }}
+          APP_VERSION_NAME: ${{ needs.resolve-version.outputs.version_name }}
+          APP_VERSION_CODE: ${{ needs.resolve-version.outputs.version_code }}
         run: |
           set -euo pipefail
 
@@ -747,6 +1492,276 @@ jobs:
           echo "Both signer fingerprints are valid and match."
           echo "::endgroup::"
 
+          echo "::group::Independent verification of the downloaded binaries"
+          # Re-inspect the DOWNLOADED files here: every fingerprint must be exactly 64-hex
+          # and equal BOTH build jobs' keystore fingerprints (which must agree).
+          ks_apks="$(printf '%s' "$KS_FP_APKS" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          ks_aab="$(printf '%s' "$KS_FP_AAB" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+
+          if [[ ! "$ks_apks" =~ $hex64 ]]; then
+            echo "::error::build-apks did not export a valid keystore fingerprint (64 hex characters required; got ${#ks_apks} characters). Refusing to publish."
+            exit 1
+          fi
+          if [[ ! "$ks_aab" =~ $hex64 ]]; then
+            echo "::error::build-aab did not export a valid keystore fingerprint (64 hex characters required; got ${#ks_aab} characters). Refusing to publish."
+            exit 1
+          fi
+          if [[ "$ks_apks" != "$ks_aab" ]]; then
+            echo "::error::The two build jobs disagree about the release keystore certificate fingerprint (${ks_apks} vs ${ks_aab}). Refusing to publish."
+            exit 1
+          fi
+          KEYSTORE_FP="$ks_apks"
+
+          if [[ "$apk_signer" != "$KEYSTORE_FP" || "$aab_signer" != "$KEYSTORE_FP" ]]; then
+            echo "::error::Build-job signer outputs (${apk_signer}, ${aab_signer}) do not match the keystore fingerprint (${KEYSTORE_FP}). Refusing to publish."
+            exit 1
+          fi
+
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          shopt -s nullglob
+          check_apks=(dist/*.apk)
+          check_aabs=(dist/*.aab)
+          pub_ref_pkg=""
+
+          if [[ ${#check_apks[@]} -ne 2 || ${#check_aabs[@]} -ne 1 ]]; then
+            echo "::error::Independent signature verification requires exactly 2 APKs and 1 AAB (found ${#check_apks[@]} APK(s) and ${#check_aabs[@]} AAB(s))."
+            exit 1
+          fi
+
+          for apk in "${check_apks[@]}"; do
+            apk_name="$(basename "$apk")"
+            set +e
+            apk_certs="$("$BT/apksigner" verify --print-certs "$apk" 2>&1)"
+            apksigner_rc=$?
+            set -e
+            printf '%s\n' "$apk_certs"
+            if [[ $apksigner_rc -ne 0 ]]; then
+              echo "::error::${apk_name}: apksigner could not verify the DOWNLOADED APK (exit ${apksigner_rc})."
+              exit 1
+            fi
+            if printf '%s\n' "$apk_certs" | grep -q 'Signer #2'; then
+              echo "::error::${apk_name}: unexpected multiple signers detected on downloaded APK."
+              exit 1
+            fi
+
+            apk_fp="$(printf '%s\n' "$apk_certs" |
+              awk '/Signer #1 certificate SHA-256 digest/ {print $NF; exit}' |
+              tr -d ':' | tr '[:upper:]' '[:lower:]')"
+            if [[ ! "$apk_fp" =~ $hex64 ]]; then
+              echo "::error::${apk_name}: no valid 64-hex signer fingerprint extracted from the downloaded APK."
+              exit 1
+            fi
+            if [[ "$apk_fp" != "$KEYSTORE_FP" ]]; then
+              echo "::error::${apk_name}: downloaded APK is signed by ${apk_fp}, not by the release keystore certificate ${KEYSTORE_FP}. Refusing to publish."
+              exit 1
+            fi
+
+            # Independent manifest badging re-check on the DOWNLOADED bytes.
+            if ! badging="$("$BT/aapt2" dump badging "$apk" 2>&1)"; then
+              echo "::error::${apk_name}: aapt2 dump badging failed on downloaded APK."
+              printf '%s\n' "$badging"
+              exit 1
+            fi
+            if printf '%s\n' "$badging" | grep -Eq '^application-debuggable([[:space:]]|$)'; then
+              echo "::error::${apk_name}: downloaded APK has application-debuggable set; refusing to publish."
+              exit 1
+            fi
+            pkg_line="$(printf '%s\n' "$badging" | grep -m 1 '^package:' || true)"
+            apk_pkg="$(printf '%s\n' "$pkg_line" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
+            apk_vcode="$(printf '%s\n' "$pkg_line" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")"
+            apk_vname="$(printf '%s\n' "$pkg_line" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")"
+            if [[ -z "$apk_pkg" ]]; then
+              echo "::error::${apk_name}: could not extract applicationId from downloaded APK."
+              exit 1
+            fi
+            if [[ -z "$pub_ref_pkg" ]]; then
+              pub_ref_pkg="$apk_pkg"
+            elif [[ "$apk_pkg" != "$pub_ref_pkg" ]]; then
+              echo "::error::${apk_name}: downloaded APK applicationId mismatch (${apk_pkg} vs ${pub_ref_pkg})."
+              exit 1
+            fi
+            if [[ "$apk_vname" != "$APP_VERSION_NAME" ]]; then
+              echo "::error::${apk_name}: downloaded APK versionName '${apk_vname}' does not match '${APP_VERSION_NAME}'."
+              exit 1
+            fi
+            if [[ ! "$apk_vcode" =~ ^[0-9]+$ ]] || (( 10#$apk_vcode < 10#$APP_VERSION_CODE )); then
+              echo "::error::${apk_name}: downloaded APK versionCode '${apk_vcode}' is below '${APP_VERSION_CODE}'."
+              exit 1
+            fi
+
+            echo "Independently verified ${apk_name} (pkg=${apk_pkg}, versionName=${apk_vname}, versionCode=${apk_vcode}, single signer matches keystore)."
+          done
+
+          aab_file="${check_aabs[0]}"
+          aab_name="$(basename "$aab_file")"
+
+          # Independent ENTRY-LEVEL gate on the DOWNLOADED AAB (rationale: see build-aab):
+          # `jarsigner -verify` alone exits 0 for partially signed archives, so every payload
+          # entry must carry the 's' flag; `-strict` is not used (self-signed trust-chain
+          # warnings are not unsigned-entry detection); CR stripped first because jarsigner
+          # may emit CRLF and names must never carry line-ending bytes.
+          set +e
+          js_out="$(LC_ALL=C jarsigner -J-Duser.language=en -J-Duser.country=US -verify -verbose "$aab_file" 2>&1)"
+          js=$?
+          set -e
+          printf '%s\n' "$js_out"
+          if [[ $js -ne 0 ]]; then
+            echo "::error::${aab_name}: jarsigner reported the DOWNLOADED AAB as NOT verified (exit ${js}) - integrity failure."
+            exit 1
+          fi
+          if printf '%s\n' "$js_out" | grep -q '^jar is unsigned\.'; then
+            echo "::error::${aab_name}: jarsigner reports the DOWNLOADED AAB as UNSIGNED - refusing to publish it."
+            exit 1
+          fi
+
+          signed_entries="$(printf '%s\n' "$js_out" | awk '
+            { sub(/\r$/, "") }
+            match($0, /^[ ]*[a-z?]*[ ]+[0-9][0-9]* [A-Za-z][A-Za-z][A-Za-z] [A-Za-z][A-Za-z][A-Za-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [^ ]+ [0-9][0-9][0-9][0-9] /) {
+              flags = substr($0, 1, RLENGTH)
+              sub(/ [0-9].*$/, "", flags)
+              if (flags ~ /s/) print substr($0, RLENGTH + 1)
+            }')"
+          aab_entries="$(unzip -Z1 "$aab_file")"
+          if ! printf '%s\n' "$aab_entries" | grep -qx 'base/manifest/AndroidManifest.xml'; then
+            echo "::error::${aab_name}: downloaded AAB is missing base/manifest/AndroidManifest.xml."
+            exit 1
+          fi
+
+          payload_entries="$(printf '%s\n' "$aab_entries" | awk '
+            { sub(/\r$/, "") }
+            /\/$/ { next }
+            { lower = tolower($0) }
+            lower == "meta-inf/manifest.mf" { next }
+            lower ~ /^meta-inf\/[^\/]+\.(sf|rsa|dsa|ec)$/ { next }
+            lower ~ /^meta-inf\/sig-/ { next }
+            { print }')"
+          if [[ -z "$payload_entries" ]]; then
+            echo "::error::${aab_name}: the DOWNLOADED AAB exposes no payload entries to verify - refusing to publish it."
+            exit 1
+          fi
+          unsigned_payload="$(comm -23 \
+            <(printf '%s\n' "$payload_entries" | sort -u) \
+            <(printf '%s\n' "$signed_entries" | sort -u))"
+          if [[ -n "$unsigned_payload" ]]; then
+            echo "::error::${aab_name}: the DOWNLOADED AAB contains UNSIGNED payload entries - a partially signed archive is never published:"
+            printf '%s\n' "$unsigned_payload" | sed 's/^/  unsigned: /'
+            exit 1
+          fi
+          echo "Entry-level signature check passed for ${aab_name}: every payload entry is signed."
+
+          set +e
+          aab_cert="$(keytool -printcert -jarfile "$aab_file" 2>&1)"
+          kt=$?
+          set -e
+          if [[ $kt -ne 0 ]]; then
+            echo "::error::${aab_name}: keytool could not read the downloaded AAB's certificate (exit ${kt})."
+            printf '%s\n' "$aab_cert"
+            exit 1
+          fi
+          if printf '%s\n' "$aab_cert" | grep -q 'Signer #2:'; then
+            echo "::error::${aab_name}: unexpected multiple signers detected in downloaded AAB."
+            exit 1
+          fi
+
+          aab_fp="$(printf '%s\n' "$aab_cert" |
+            sed -n 's/^[[:space:]]*SHA-\{0,1\}256:[[:space:]]*\([0-9A-Fa-f:]*\).*/\1/p' |
+            head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          if [[ ! "$aab_fp" =~ $hex64 ]]; then
+            echo "::error::${aab_name}: no valid 64-hex certificate fingerprint extracted from the downloaded AAB."
+            printf '%s\n' "$aab_cert"
+            exit 1
+          fi
+          if [[ "$aab_fp" != "$KEYSTORE_FP" ]]; then
+            echo "::error::${aab_name}: downloaded AAB is signed by ${aab_fp}, not by the release keystore certificate ${KEYSTORE_FP}. Refusing to publish."
+            exit 1
+          fi
+          echo "Independently verified ${aab_name}: downloaded AAB integrity OK and signed by the release keystore certificate."
+
+          # Independent VERSION verification of the DOWNLOADED AAB: aapt2 refuses
+          # bundles ("could not identify format of APK"), so bundletool is the only
+          # tool that can dump a bundle manifest. Its jar is fetched from the
+          # upstream GitHub release and pinned by SHA-256 before it is executed.
+          # bundletool is a JVM tool: actions/setup-java runs earlier in this job,
+          # so inside GitHub Actions a missing JVM is a hard failure rather than a
+          # silent skip; a JVM-less local harness skips the check instead.
+          if command -v java >/dev/null 2>&1; then
+            BT_VERSION="1.18.3"
+            BT_JAR_NAME="bundletool-all-${BT_VERSION}.jar"
+            BT_URL="https://github.com/google/bundletool/releases/download/${BT_VERSION}/${BT_JAR_NAME}"
+            BT_SHA256="a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29"
+            BT_DIR="${RUNNER_TEMP}/bundletool"
+            BT_JAR="${BT_DIR}/${BT_JAR_NAME}"
+            mkdir -p "$BT_DIR"
+
+            if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 \
+                -o "$BT_JAR" "$BT_URL"; then
+              echo "::error::Could not download pinned bundletool ${BT_VERSION}; refusing to publish an AAB whose version was not independently verified."
+              rm -f "$BT_JAR"
+              exit 1
+            fi
+            if ! (cd "$BT_DIR" && printf '%s  %s\n' "$BT_SHA256" "$BT_JAR_NAME" |
+                  sha256sum --check --strict -); then
+              echo "::error::Downloaded bundletool ${BT_VERSION} failed SHA-256 integrity verification; refusing to publish an AAB whose version was not independently verified."
+              rm -f "$BT_JAR"
+              exit 1
+            fi
+            echo "Pinned bundletool ${BT_VERSION} downloaded and SHA-256 verified."
+
+            # bundletool/JVM warnings go to STDERR, so the attribute value is read
+            # from STDOUT only (stderr is retained for diagnostics on failure).
+            # bundletool exits 0 with EMPTY stdout when an xpath matches nothing, so
+            # emptiness is rejected explicitly. CR is stripped because some JVMs
+            # emit CRLF and a version value must never carry line-ending bytes.
+            BT_ERR="${RUNNER_TEMP}/bundletool-dump.err"
+            : > "$BT_ERR"
+            set +e
+            aab_pkg="$(java -jar "$BT_JAR" dump manifest --bundle="$aab_file" --xpath=/manifest/@package 2>>"$BT_ERR")"
+            pkg_rc=$?
+            aab_vname="$(java -jar "$BT_JAR" dump manifest --bundle="$aab_file" --xpath=/manifest/@android:versionName 2>>"$BT_ERR")"
+            vname_rc=$?
+            aab_vcode="$(java -jar "$BT_JAR" dump manifest --bundle="$aab_file" --xpath=/manifest/@android:versionCode 2>>"$BT_ERR")"
+            vcode_rc=$?
+            set -e
+            aab_pkg="$(printf '%s' "$aab_pkg" | tr -d '\r' | head -n 1)"
+            aab_vname="$(printf '%s' "$aab_vname" | tr -d '\r' | head -n 1)"
+            aab_vcode="$(printf '%s' "$aab_vcode" | tr -d '\r' | head -n 1)"
+
+            if [[ $pkg_rc -ne 0 || -z "$aab_pkg" ]]; then
+              echo "::error::bundletool could not read the package name of the DOWNLOADED ${aab_name} (exit ${pkg_rc})."
+              if [[ -s "$BT_ERR" ]]; then sed 's/^/  /' "$BT_ERR"; fi
+              exit 1
+            fi
+            if [[ $vname_rc -ne 0 || -z "$aab_vname" ]]; then
+              echo "::error::bundletool could not read versionName of the DOWNLOADED ${aab_name} (exit ${vname_rc})."
+              if [[ -s "$BT_ERR" ]]; then sed 's/^/  /' "$BT_ERR"; fi
+              exit 1
+            fi
+            if [[ $vcode_rc -ne 0 || -z "$aab_vcode" ]]; then
+              echo "::error::bundletool could not read versionCode of the DOWNLOADED ${aab_name} (exit ${vcode_rc})."
+              if [[ -s "$BT_ERR" ]]; then sed 's/^/  /' "$BT_ERR"; fi
+              exit 1
+            fi
+            if [[ "$aab_pkg" != "$pub_ref_pkg" ]]; then
+              echo "::error::${aab_name}: bundletool package '${aab_pkg}' does not match the reference applicationId '${pub_ref_pkg}' read from the downloaded APKs."
+              exit 1
+            fi
+            if [[ "$aab_vname" != "$APP_VERSION_NAME" ]]; then
+              echo "::error::${aab_name}: bundletool versionName '${aab_vname}' does not match resolved APP_VERSION_NAME '${APP_VERSION_NAME}'."
+              exit 1
+            fi
+            if [[ "$aab_vcode" != "$APP_VERSION_CODE" ]]; then
+              echo "::error::${aab_name}: bundletool versionCode '${aab_vcode}' does not match resolved APP_VERSION_CODE '${APP_VERSION_CODE}'."
+              exit 1
+            fi
+            echo "Independently verified ${aab_name} with pinned bundletool ${BT_VERSION} (pkg=${aab_pkg}, versionName=${aab_vname}, versionCode=${aab_vcode})."
+          elif [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+            echo "::error::java is unavailable; the downloaded AAB's version cannot be independently verified. Refusing to publish."
+            exit 1
+          else
+            echo "bundletool AAB version verification skipped: no JVM in this environment (GitHub Actions always provides one via actions/setup-java)."
+          fi
+          echo "::endgroup::"
+
           echo "::group::Release payload validation"
           shopt -s nullglob
           apks=(dist/*.apk)
@@ -774,23 +1789,22 @@ jobs:
       - name: Prepare release metadata and checksums
         id: metadata
         shell: bash
+        env:
+          VERSION_NAME: ${{ needs.resolve-version.outputs.version_name }}
+          VERSION_CODE: ${{ needs.resolve-version.outputs.version_code }}
+          RESOLVED_SOURCE_SHA: ${{ needs.resolve-run.outputs.current_sha }}
+          APK_SOURCE_SHA: ${{ needs.build-apks.outputs.source_sha }}
+          AAB_SOURCE_SHA: ${{ needs.build-aab.outputs.source_sha }}
         run: |
           set -euo pipefail
 
-          VERSION_NAME="$(sed -n \
-            's/.*versionName = "\([^"]*\)".*/\1/p' \
-            pahebatcher/build.gradle.kts | head -n 1)"
-
-          VERSION_CODE="$(sed -n \
-            's/.*versionCode = \([0-9][0-9]*\).*/\1/p' \
-            pahebatcher/build.gradle.kts | head -n 1)"
-
           if [[ -z "$VERSION_NAME" || -z "$VERSION_CODE" ]]; then
-            echo "::error::Could not read versionName/versionCode from Gradle."
+            echo "::error::Could not read resolved versionName/versionCode."
             exit 1
           fi
 
-          if [[ ! "$VERSION_NAME" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+          if [[ ! "$VERSION_NAME" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]] ||
+             ! git check-ref-format "refs/tags/v${VERSION_NAME}" >/dev/null 2>&1; then
             echo "::error::versionName contains unsupported tag characters."
             exit 1
           fi
@@ -798,6 +1812,17 @@ jobs:
           TAG="v${VERSION_NAME}"
           TARGET="$(git rev-parse HEAD)"
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+
+          # build-metadata.json must record the FULL source SHA both builds checked out.
+          if [[ ! "$TARGET" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Checked-out source commit '${TARGET}' is not a full 40-hex SHA; refusing to publish."
+            exit 1
+          fi
+          if [[ "$RESOLVED_SOURCE_SHA" != "$TARGET" || "$APK_SOURCE_SHA" != "$TARGET" || "$AAB_SOURCE_SHA" != "$TARGET" ]]; then
+            echo "::error::Source commit mismatch: publish=${TARGET}, resolve-run=${RESOLVED_SOURCE_SHA:-<empty>}, build-apks=${APK_SOURCE_SHA:-<empty>}, build-aab=${AAB_SOURCE_SHA:-<empty>}. build-metadata.json would not describe the built source; refusing to publish."
+            exit 1
+          fi
+          echo "Source commit 4-way cross-check passed: ${TARGET}"
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
@@ -807,6 +1832,8 @@ jobs:
             sha256sum ./*.apk ./*.aab > SHA256SUMS.txt
           )
 
+          # `commit` = FULL 40-hex source SHA (never the later version-sync commit); all
+          # pre-existing fields are preserved for existing consumers.
           jq -n \
             --arg versionName "$VERSION_NAME" \
             --arg versionCode "$VERSION_CODE" \
@@ -821,8 +1848,8 @@ jobs:
               builtAtUtc: $builtAt
             }' > dist/build-metadata.json
 
-      # Fail safely on EITHER a pre-existing tag or a pre-existing release.
-      # Never overwrite a release, never move an existing tag.
+      # Fail safely on a pre-existing tag OR release: never overwrite, never move a tag.
+      # Only a genuine 404 means "absent"; other API errors fail the job.
       - name: Ensure neither tag nor release already exists
         env:
           TAG: ${{ steps.metadata.outputs.tag }}
@@ -834,13 +1861,45 @@ jobs:
             exit 1
           fi
 
-          if gh release view "$TAG" > /dev/null 2>&1; then
+          ENCODED_TAG="$(jq -rn --arg v "$TAG" '$v|@uri')"
+          HTTP_STATE="error"
+          probe_http() {
+            local url="$1" label="$2" code
+            HTTP_STATE="error"
+            if ! code="$(curl -sS --connect-timeout 15 --max-time 60 \
+                --retry 3 --retry-delay 2 --retry-connrefused \
+                -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$url")"; then
+              echo "::error::Network failure while checking ${label}. Refusing to publish on an unknown state."
+              return 0
+            fi
+            case "$code" in
+              200) HTTP_STATE="exists" ;;
+              404) HTTP_STATE="absent" ;;
+              *)
+                echo "::error::GitHub API returned HTTP ${code} while checking ${label}. An API failure is never treated as a missing object; refusing to publish."
+                HTTP_STATE="error" ;;
+            esac
+          }
+
+          probe_http "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_TAG}" "release ${TAG}"
+          if [[ "$HTTP_STATE" == "error" ]]; then
+            exit 1
+          fi
+          if [[ "$HTTP_STATE" == "exists" ]]; then
             echo "::error::A GitHub Release for ${TAG} already exists. Refusing to overwrite it or replace its assets."
             exit 1
           fi
 
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" > /dev/null 2>&1; then
-            echo "::error::Tag ${TAG} already exists. Bump versionName before releasing."
+          probe_http "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${ENCODED_TAG}" "tag ${TAG}"
+          if [[ "$HTTP_STATE" == "error" ]]; then
+            exit 1
+          fi
+          if [[ "$HTTP_STATE" == "exists" ]]; then
+            echo "::error::Tag ${TAG} already exists on GitHub."
             exit 1
           fi
 
@@ -866,44 +1925,364 @@ jobs:
           echo "Published ${TAG} targeting ${TARGET}"
 
   # ---------------------------------------------------------------------------
-  # CLEANUP - the SINGLE owner of temporary-storage deletion.
-  #
-  #   * Cleanup waits for every job and runs after publish is terminal, so
-  #     it cannot race with artifact upload/download.
-  #   * Deletes this run's two temporary artifacts, then clears matching
-  #     legacy handoff cache keys. Gradle dependency cache is retained.
-  #   * Holds actions: write for artifact/cache API cleanup; no checkout,
-  #     build toolchain or signing secrets.
-  #   * Missing entries/API errors are warnings. One-day artifact retention
-  #     is the fallback if explicit deletion fails.
+  # VERSION-SYNC - runs ONLY after successful publish. Updates the Gradle version
+  # files AND the README reference in ONE idempotent commit/PR:
+  #   * a new sync branch starts at main's tip; an existing one is brought up to
+  #     date by a plain MERGE of main (never rebase - that would need the forbidden
+  #     force-push), so re-runs after completion create no commit, conflicts fail
+  #     explicitly, and pushes stay fast-forward-only.
+  #   * the branch is probed with explicit ls-remote exit codes (0 exists, 2 absent,
+  #     anything else fails), validated to touch ONLY pahebatcher/build.gradle.kts
+  #     + README.md, pushed without --force; an existing open PR is reused (never
+  #     duplicated), a missing one created; gh failures fail the job. Failure is
+  #     reported separately with the exact version/files/branch needed to retry.
+  #   * holds contents: write + pull-requests: write.
+  # ---------------------------------------------------------------------------
+  version-sync:
+    name: Synchronize version files
+    if: >-
+      success() &&
+      needs.resolve-run.outputs.should_release == 'true' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        !startsWith(github.event.pull_request.head.ref, 'chore/version-sync-')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor == 'HellHarbinger' &&
+        github.triggering_actor == 'HellHarbinger'))
+    needs: [resolve-run, resolve-version, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    permissions:
+      contents: write   # commit the version-sync change
+      pull-requests: write # open version-sync PR if direct push is blocked by branch protection
+
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PAT || github.token }}
+
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Sync Gradle version files and README (same commit/PR)
+        env:
+          VERSION_NAME: ${{ needs.resolve-version.outputs.version_name }}
+          VERSION_CODE: ${{ needs.resolve-version.outputs.version_code }}
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$VERSION_NAME" || -z "$VERSION_CODE" ]]; then
+            echo "::error::Could not read resolved versionName/versionCode; refusing to synchronize. The published release is unaffected - retry this job."
+            exit 1
+          fi
+          if [[ ! "$VERSION_NAME" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]] ||
+             ! git check-ref-format "refs/heads/chore/version-sync-${VERSION_NAME}" >/dev/null 2>&1; then
+            echo "::error::versionName contains unsupported characters; refusing to synchronize. The published release is unaffected - retry this job."
+            exit 1
+          fi
+
+          echo "Synchronizing pahebatcher/build.gradle.kts AND README.md to versionName=${VERSION_NAME}, versionCode=${VERSION_CODE}"
+
+          # Explicit git auth: checkout ran persist-credentials: false and gh CLI does
+          # NOT auth raw git, so an Authorization header scoped to github.com is written
+          # ONLY into this repo's local git config (RELEASE_PAT if set, else GITHUB_TOKEN)
+          # - never a remote URL, never echoed - authenticating both pushes.
+          if [[ -n "${RELEASE_PAT:-}" ]]; then
+            GIT_AUTH_TOKEN="$RELEASE_PAT"
+            echo "Configuring git authentication for github.com using RELEASE_PAT (value never printed)."
+          elif [[ -n "${GH_TOKEN:-}" ]]; then
+            GIT_AUTH_TOKEN="$GH_TOKEN"
+            echo "Configuring git authentication for github.com using the built-in GITHUB_TOKEN (value never printed)."
+          else
+            echo "::error::No git credential available: RELEASE_PAT and GH_TOKEN are both empty. The published release is unaffected - configure a token and retry this job."
+            exit 1
+          fi
+          BASIC_AUTH="$(printf 'x-access-token:%s' "$GIT_AUTH_TOKEN" | base64 -w0 | tr -d '\n')"
+          echo "::add-mask::${BASIC_AUTH}"
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic ${BASIC_AUTH}"
+          unset GIT_AUTH_TOKEN BASIC_AUTH
+
+          # Strip the injected Authorization header on ANY exit path so the
+          # credential cannot be read by a later step or the runner log.
+          cleanup_git_auth() {
+            git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          }
+          trap cleanup_git_auth EXIT
+
+          # Committer identity set BEFORE any commit/merge (local config scope only).
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          SYNC_BRANCH="chore/version-sync-${VERSION_NAME}"
+
+          # Ensure an OPEN sync PR exists: an existing PR is REUSED (never duplicated);
+          # auth/permission/API failures FAIL the job, never hidden behind `|| true`.
+          ensure_version_sync_pr() {
+            local pr_list create_out
+            if ! pr_list="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --base main \
+                --state open --json number,url 2>&1)"; then
+              echo "::error::Could not query for an existing version-sync pull request (${SYNC_BRANCH}). The published release is unaffected - retry this job."
+              printf '%s\n' "$pr_list" | sed 's/^/  /'
+              exit 1
+            fi
+            if [[ -n "$pr_list" && "$pr_list" != "[]" ]]; then
+              echo "Reusing existing version-sync pull request: ${pr_list}"
+              echo "::notice::Version-sync pull request for ${VERSION_NAME} already exists; no duplicate PR was created."
+              return 0
+            fi
+
+            if ! create_out="$(gh pr create \
+                --repo "$GITHUB_REPOSITORY" \
+                --head "$SYNC_BRANCH" \
+                --base "main" \
+                --title "chore: sync version ${VERSION_NAME} in build.gradle.kts and README" \
+                --body "Automated version sync (build.gradle.kts + README.md) following release v${VERSION_NAME} (versionCode ${VERSION_CODE})." 2>&1)"; then
+              # PR may have been created concurrently: re-check once before failing.
+              if pr_list="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --base main \
+                  --state open --json number,url 2>/dev/null)" && \
+                 [[ -n "$pr_list" && "$pr_list" != "[]" ]]; then
+                echo "Reusing version-sync pull request created concurrently: ${pr_list}"
+                return 0
+              fi
+              echo "::error::Could not create the version-sync pull request for ${SYNC_BRANCH}. Authentication, permission and API failures are reported here and are never hidden. The published release is unaffected - retry this job."
+              printf '%s\n' "$create_out" | sed 's/^/  /'
+              exit 1
+            fi
+            echo "Opened version-sync pull request for ${SYNC_BRANCH}: ${create_out}"
+          }
+
+          # Fetch main's current tip: new-branch base, merge source, no-op re-run.
+          if ! git fetch origin main; then
+            echo "::error::Could not fetch origin/main for version synchronization. The published release is unaffected - retry this job."
+            exit 1
+          fi
+          MAIN_SHA="$(git rev-parse FETCH_HEAD)"
+          if [[ ! "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve the full 40-hex tip commit of main; refusing to synchronize. The published release is unaffected - retry this job."
+            exit 1
+          fi
+
+          # Probe the branch BEFORE any edit: ls-remote --exit-code is 0 = exists,
+          # 2 = absent, anything else = query failure which is NEVER read as "absent".
+          set +e
+          git ls-remote --exit-code --heads origin "refs/heads/${SYNC_BRANCH}" \
+            >/dev/null 2>"${RUNNER_TEMP}/sync-ls-remote.err"
+          ls_rc=$?
+          set -e
+          if [[ "$ls_rc" -ne 0 && "$ls_rc" -ne 2 ]]; then
+            echo "::error::Could not determine whether version-sync branch ${SYNC_BRANCH} exists (git ls-remote exit ${ls_rc}). The published release is unaffected - retry this job."
+            if [[ -s "${RUNNER_TEMP}/sync-ls-remote.err" ]]; then
+              sed 's/^/  /' "${RUNNER_TEMP}/sync-ls-remote.err"
+            fi
+            exit 1
+          fi
+
+          BASE_IS_MAIN="true"
+          if [[ "$ls_rc" -eq 0 ]]; then
+            BASE_IS_MAIN="false"
+            echo "Version-sync branch ${SYNC_BRANCH} already exists on origin; validating it instead of overwriting it."
+            if ! git fetch origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}"; then
+              echo "::error::Could not fetch the existing version-sync branch ${SYNC_BRANCH}. The published release is unaffected - retry this job."
+              exit 1
+            fi
+            if ! FORK_POINT="$(git merge-base "$MAIN_SHA" "refs/remotes/origin/${SYNC_BRANCH}")"; then
+              echo "::error::Existing version-sync branch ${SYNC_BRANCH} does not share history with main; refusing to continue. The published release is unaffected - investigate the branch and retry this job."
+              exit 1
+            fi
+            # An existing branch may touch ONLY the two synced files; else fail safely.
+            UNEXPECTED="$(git diff --name-status "$FORK_POINT" "refs/remotes/origin/${SYNC_BRANCH}" |
+              awk '$1 != "M" || ($2 != "pahebatcher/build.gradle.kts" && $2 != "README.md")')"
+            if [[ -n "$UNEXPECTED" ]]; then
+              echo "::error::Existing version-sync branch ${SYNC_BRANCH} contains unexpected changes (only modifications to pahebatcher/build.gradle.kts and README.md are allowed). Refusing to overwrite it - it is never force-pushed. Investigate the branch, then retry this job."
+              printf '%s\n' "$UNEXPECTED" | sed 's/^/  /'
+              exit 1
+            fi
+            git checkout -B pb-version-sync "refs/remotes/origin/${SYNC_BRANCH}"
+            # When main advanced, MERGE main into the branch - never rebase (a rebase
+            # rewrites history and would need the forbidden force-push). Keeps every branch
+            # commit, the push fast-forward-only; conflicts fail explicitly.
+            if ! git merge-base --is-ancestor "$MAIN_SHA" HEAD; then
+              set +e
+              git merge --no-edit "$MAIN_SHA" >"${RUNNER_TEMP}/sync-merge.log" 2>&1
+              merge_rc=$?
+              set -e
+              sed 's/^/  /' "${RUNNER_TEMP}/sync-merge.log"
+              if [[ "$merge_rc" -ne 0 ]]; then
+                echo "::error::Could not merge main (${MAIN_SHA}) into version-sync branch ${SYNC_BRANCH} (merge conflict or merge failure). The branch is never force-pushed or overwritten and the published release is unaffected - resolve the conflict on the branch, then retry this job."
+                exit 1
+              fi
+            fi
+          else
+            git checkout -B pb-version-sync "$MAIN_SHA"
+          fi
+
+          # Gradle version files (existing mechanism, unchanged).
+          sed -i "s/versionCode = .*/versionCode = providers.gradleProperty(\"appVersionCode\").orNull?.toInt() ?: ${VERSION_CODE}/" pahebatcher/build.gradle.kts
+          sed -i "s/versionName = .*/versionName = providers.gradleProperty(\"appVersionName\").orNull ?: \"${VERSION_NAME}\"/" pahebatcher/build.gradle.kts
+
+          # Verify the Gradle edit actually landed: re-read the file with the SAME
+          # extraction rules resolve-version uses, require exactly one assignment
+          # per property, and require the value to equal what was just published.
+          # The assignment count tolerates whitespace around '=' so a no-space
+          # duplicate cannot slip past; extraction and comparison are unchanged.
+          # A duplicated, malformed or unmatched assignment fails HERE instead of
+          # being committed as an unverified "synchronized" version.
+          GRADLE_NAME_LINES="$(grep -c '^[[:space:]]*versionName[[:space:]]*=' pahebatcher/build.gradle.kts || true)"
+          GRADLE_CODE_LINES="$(grep -c '^[[:space:]]*versionCode[[:space:]]*=' pahebatcher/build.gradle.kts || true)"
+          if [[ "$GRADLE_NAME_LINES" -ne 1 || "$GRADLE_CODE_LINES" -ne 1 ]]; then
+            echo "::error::pahebatcher/build.gradle.kts must hold exactly one versionName and one versionCode assignment after synchronization (found ${GRADLE_NAME_LINES} and ${GRADLE_CODE_LINES}); refusing to commit an unverified version sync. The published release is unaffected."
+            exit 1
+          fi
+
+          SYNC_NAME="$(sed -n 's/.*versionName = .*"\([^"]*\)".*/\1/p' pahebatcher/build.gradle.kts | head -n 1)"
+          if [[ -z "$SYNC_NAME" ]]; then
+            SYNC_NAME="$(sed -n 's/.*versionName = \([a-zA-Z0-9._+-][a-zA-Z0-9._+-]*\).*/\1/p' pahebatcher/build.gradle.kts | head -n 1)"
+          fi
+          SYNC_CODE="$(sed -n 's/.*versionCode = \([0-9][0-9]*\).*/\1/p' pahebatcher/build.gradle.kts | head -n 1)"
+          if [[ -z "$SYNC_CODE" ]]; then
+            SYNC_CODE="$(sed -n '/versionCode/ s/.*?: \([0-9][0-9]*\).*/\1/p' pahebatcher/build.gradle.kts | head -n 1)"
+          fi
+
+          if [[ -z "$SYNC_NAME" || -z "$SYNC_CODE" ]]; then
+            echo "::error::Could not re-read the synchronized version from pahebatcher/build.gradle.kts (versionName='${SYNC_NAME}', versionCode='${SYNC_CODE}'); refusing to commit an unverified version sync. The published release is unaffected."
+            exit 1
+          fi
+          if [[ "$SYNC_NAME" != "$VERSION_NAME" ]]; then
+            echo "::error::pahebatcher/build.gradle.kts versionName '${SYNC_NAME}' does not match the published versionName '${VERSION_NAME}'; refusing to commit an unverified version sync. The published release is unaffected."
+            exit 1
+          fi
+          if [[ "$SYNC_CODE" != "$VERSION_CODE" ]]; then
+            echo "::error::pahebatcher/build.gradle.kts versionCode '${SYNC_CODE}' does not match the published versionCode '${VERSION_CODE}'; refusing to commit an unverified version sync. The published release is unaffected."
+            exit 1
+          fi
+          echo "Verified pahebatcher/build.gradle.kts: versionName=${SYNC_NAME}, versionCode=${SYNC_CODE}."
+
+          # README reference updated in the SAME commit/PR; only the current
+          # application-version line is touched (both repo styles handled; badge/
+          # dependency/example and historical versions untouched):
+          #   Style 1 (current): **Status:** vX.Y.Z ...  Style 2 (legacy): **Current status:** version **X.Y.Z** (versionCode N) ...
+          README_UPDATED=0
+          if grep -q '^\*\*Status:\*\* v' README.md; then
+            sed -i "s|^\(\*\*Status:\*\* v\)[0-9][0-9A-Za-z._+-]*|\1${VERSION_NAME}|" README.md
+            README_UPDATED=1
+          fi
+          if grep -q '^\*\*Current status:\*\* version \*\*' README.md; then
+            sed -i "s|^\(\*\*Current status:\*\* version \*\*\)[0-9][0-9A-Za-z._+-]*\(\*\* (versionCode \)[0-9][0-9]*|\1${VERSION_NAME}\2${VERSION_CODE}|" README.md
+            README_UPDATED=1
+          fi
+          if [[ "$README_UPDATED" -eq 0 ]]; then
+            # No reference exists: insert '**Status:** vX.Y.Z' before the first section
+            # heading (fallback: after the title, then the very top).
+            if grep -q '^## ' README.md; then
+              sed -i "0,/^## /s|^## |**Status:** v${VERSION_NAME}\n\n## |" README.md
+            elif grep -q '^# ' README.md; then
+              sed -i "0,/^# /s|^# \(.*\)$|# \1\n\n**Status:** v${VERSION_NAME}|" README.md
+            else
+              sed -i "1s|^|**Status:** v${VERSION_NAME}\n\n|" README.md
+            fi
+          fi
+
+          if ! { grep -qF "**Status:** v${VERSION_NAME}" README.md ||
+                 grep -qF "**Current status:** version **${VERSION_NAME}** (versionCode ${VERSION_CODE}" README.md; }; then
+            echo "::error::README application-version reference was not updated to v${VERSION_NAME} (versionCode ${VERSION_CODE}). The published release is unaffected - fix README and retry version synchronization."
+            exit 1
+          fi
+
+          git add pahebatcher/build.gradle.kts README.md
+
+          if git diff --cached --quiet; then
+            if [[ "$BASE_IS_MAIN" == "true" ]]; then
+              echo "Gradle version files and README already match versionName=${VERSION_NAME} (versionCode ${VERSION_CODE}); nothing to synchronize."
+              echo "::notice::Version synchronization is already up to date; no commit or PR was created."
+              exit 0
+            fi
+            # No version edits: only the possible main-merge is pending (or nothing).
+            if [[ "$(git rev-parse HEAD)" == "$(git rev-parse "refs/remotes/origin/${SYNC_BRANCH}")" ]]; then
+              if git merge-base --is-ancestor "refs/remotes/origin/${SYNC_BRANCH}" "$MAIN_SHA"; then
+                echo "Version-sync branch ${SYNC_BRANCH} is already merged into main; nothing to synchronize."
+                echo "::notice::Version synchronization is already on main; no commit or PR was created."
+                exit 0
+              fi
+              echo "Existing version-sync branch ${SYNC_BRANCH} already carries versionName=${VERSION_NAME} (versionCode ${VERSION_CODE}); ensuring its pull request exists."
+              ensure_version_sync_pr
+              exit 0
+            fi
+            # Only the merge commit is pending: push it without a version-bump commit.
+          else
+            git commit -m "chore: bump version to ${VERSION_NAME} (versionCode ${VERSION_CODE}) [skip ci]"
+          fi
+
+          if [[ "$BASE_IS_MAIN" == "true" ]]; then
+            # Direct push to main (established mechanism), authenticated as above.
+            if git push origin "HEAD:refs/heads/main" 2>&1; then
+              echo "Successfully synchronized build.gradle.kts and README.md on main."
+            else
+              echo "::warning::Direct push to main was blocked by branch protection."
+              echo "Release ${VERSION_NAME} was published successfully with tag v${VERSION_NAME}; only version synchronization needs a retry."
+              echo "Opening a version-sync pull request containing build.gradle.kts AND README.md..."
+
+              # New branch: plain push, --force NEVER (concurrent creation fails safely).
+              if ! git push origin "HEAD:refs/heads/${SYNC_BRANCH}"; then
+                echo "::error::Could not push version-sync branch ${SYNC_BRANCH} (fast-forward-only; force-push is never used). The published release is unaffected - retry this job."
+                exit 1
+              fi
+              ensure_version_sync_pr
+            fi
+          else
+            echo "Updating existing version-sync branch ${SYNC_BRANCH} with a fast-forward-only push (never force-pushed)..."
+            if ! git push origin "HEAD:refs/heads/${SYNC_BRANCH}"; then
+              echo "::error::Could not fast-forward existing version-sync branch ${SYNC_BRANCH}. Refusing to force-push it. The published release is unaffected - investigate the branch and retry this job."
+              exit 1
+            fi
+            ensure_version_sync_pr
+          fi
+
+  # ---------------------------------------------------------------------------
+  # CLEANUP - the SINGLE owner of temporary-artifact deletion (actions: write; no
+  # checkout/toolchain/secrets). Waits on builds -> publish -> version-sync so it
+  # cannot race uploads; the gates and resolve-version are waited on TRANSITIVELY
+  # through the builds. Warnings only; 1-day retention is the fallback.
   # ---------------------------------------------------------------------------
   cleanup:
     name: Delete temporary handoff storage
-    if: always() && github.event.pull_request.merged == true
+    # Runs only when the release pipeline actually ran (should_release=true);
+    # always() keeps it alive after ANY downstream failure.
+    if: >-
+      always() &&
+      needs.resolve-run.outputs.should_release == 'true' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        !startsWith(github.event.pull_request.head.ref, 'chore/version-sync-')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor == 'HellHarbinger' &&
+        github.triggering_actor == 'HellHarbinger'))
     needs:
-      - debug-unit-tests
-      - release-unit-tests
-      - debug-lint
+      - resolve-run
       - build-apks
       - build-aab
       - publish
-    runs-on: ubuntu-latest
+      - version-sync
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     permissions:
-      actions: write    # delete artifacts and legacy handoff caches
+      actions: write    # delete this run's temporary artifacts
 
     env:
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      # Delete this run's artifacts first, then clear matching legacy cache
-      # keys. API failures are warnings so cleanup cannot mask the real job.
-      - name: Delete this run's handoff artifacts and clear handoff caches
+      # API failures are warnings so cleanup cannot mask the real job.
+      - name: Delete this run's handoff artifacts
         shell: bash
-        env:
-          APKS_KEY: pb-release-apks-${{ github.run_id }}-${{ github.run_attempt }}
-          AAB_KEY: pb-release-aab-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -uo pipefail
 
@@ -920,17 +2299,4 @@ jobs:
             echo "::warning::Could not list this run's artifacts: ${artifact_ids}"
           fi
 
-          for key in "$APKS_KEY" "$AAB_KEY"; do
-            if response="$(gh api --method DELETE \
-              "repos/${GITHUB_REPOSITORY}/actions/caches?key=${key}" 2>&1)"; then
-              count="$(printf '%s' "$response" | jq -r '.total_count // empty')"
-              if [[ "$count" =~ ^[0-9]+$ ]]; then
-                echo "Legacy cache entries deleted for ${key}: ${count}"
-              else
-                echo "::warning::Cache deletion request succeeded for ${key}, but response was not interpretable."
-              fi
-            else
-              echo "::warning::Legacy cache deletion failed for ${key}: ${response}"
-            fi
-          done
           echo "Temporary storage cleanup finished for run ${GITHUB_RUN_ID}."

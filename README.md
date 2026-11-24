@@ -1,540 +1,354 @@
 # PaheBatcher for Android
 
-A native Android application that reproduces the behavior of the desktop
-[PaheBatcher](https://github.com/smolfiddle/pahebatcher) reference implementation:
-search an anime library, resolve episode streams, batch-download episodes as HLS
-segments, assemble them into MP4 files, export them to your device storage, and play
-them back — with a modern, Android-native UI.
+<p align="center">
+    <img width="250" height="250" alt="PaheBatcher for Android logo" src="https://github.com/user-attachments/assets/f68c227b-6b74-4fee-b117-bc5833dcb1e6" />
+</p>
 
-**Current status:** version **0.1.0** (versionCode 1) · `minSdk 32` (Android 12L+),
-`targetSdk 37` · **pre-release — not published on Google Play or anywhere else yet.**
-This repository is being prepared for its first human-reviewed push. A pre-push audit,
-a Play-policy scan and a release-artifact inspection were run on 2026-10-24; their
-evidence lives in [`PRE_PUSH_CHECKLIST.md`](PRE_PUSH_CHECKLIST.md) and
-[`PLAY_POLICY_FINDINGS.md`](PLAY_POLICY_FINDINGS.md).
+<br/>
 
-> **No affiliation, no Play approval.** This project is an independent reimplementation
-> of a third-party desktop tool. Nothing here claims Google Play policy compliance or
-> store approval; the policy scan in this repository is advisory only.
+<p align="center">
+  <strong>Find any anime, queue single episodes or whole batches, and watch them —<br/>
+  a native Android app for the PaheBatcher workflow.</strong>
+</p>
+
+<br/>
+
+<p align="center">
+  <a href="https://github.com/HellHarbinger/PaheBatcher-Droid/releases"><img src="https://img.shields.io/github/v/release/HellHarbinger/PaheBatcher-Droid?display_name=tag&label=release" alt="Latest release"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="License: GPL-3.0-or-later"/></a>
+  <a href="#download-and-installation"><img src="https://img.shields.io/badge/Android-12L%2B%20(API%2032)-3DDC84?logo=android&logoColor=white" alt="Android 12L+ (API 32)"/></a>
+  <a href="#building-from-source"><img src="https://img.shields.io/badge/Kotlin-2.4.20-7F52FF?logo=kotlin&logoColor=white" alt="Kotlin 2.4.20"/></a>
+</p>
+
+<br/>
+
+<p align="center">
+  <a href="#download-and-installation">Download</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#how-to-use">How to Use</a> ·
+  <a href="#documentation">Documentation</a> ·
+  <a href="#license">License</a>
+</p>
 
 ---
 
-## Acknowledgments
+## At a Glance
 
-A huge thank-you to [SmolFiddle](https://github.com/smolfiddle) and the original
-[PaheBatcher project](https://github.com/smolfiddle/pahebatcher). Their work and
-guidance helped this Android project at multiple stages of development, and their
-contributions were especially significant to the design of its logo. I'm deeply
-grateful for their help and for the foundation and inspiration they provided. The
-logo will be updated in a future revision.
+| You can                         | How                                                                                      |
+|---------------------------------|------------------------------------------------------------------------------------------|
+| **Find anime**                  | Search from the Home screen; results open straight into the anime's page                 |
+| **Browse episodes**             | A paged episode list per anime                                                           |
+| **Pick audio & quality**        | Audio options (e.g. `JPN` / `ENG`) per anime or per episode; quality 360p / 720p / 1080p |
+| **Download one or many**        | A single episode, the current page, or a selected range (up to 100 episodes per batch)   |
+| **Track and control downloads** | A queue tab with live progress and per-episode Pause / Resume / Cancel / Retry           |
+| **Watch**                       | Play finished episodes in-app, or stream them without downloading                        |
+| **Follow series**               | A watchlist with background checks and a "new episodes" notification                     |
+| **Configure**                   | Quality, parallel download limits, Wi-Fi-only mode, storage folder, notification toggles |
 
----
+**Status:** v0.2.0 — an early-stage release distributed as signed builds on the
+[Releases page](https://github.com/HellHarbinger/PaheBatcher-Droid/releases). **Not on Google
+Play.** Requires Android 12L (API 32)+ and a 64-bit device.
 
-## Table of contents
+## Table of Contents
 
-- [Project status](#project-status)
-- [Acknowledgments](#acknowledgments)
+- [What Is PaheBatcher for Android?](#what-is-pahebatcher-for-android)
 - [Features](#features)
-- [Documentation map](#documentation-map)
-- [Installing and using the release APK](#installing-and-using-the-release-apk)
-- [Building from source](#building-from-source)
+- [Download and Installation](#download-and-installation)
+- [Quick Start](#quick-start)
+- [How to Use](#how-to-use)
+- [Settings and Configuration](#settings-and-configuration)
+- [Where Downloads Are Saved](#where-downloads-are-saved)
+- [Known Limitations](#known-limitations)
+- [Documentation](#documentation)
+- [Building from Source](#building-from-source)
 - [Architecture](#architecture)
-- [How the main flows work](#how-the-main-flows-work)
-- [Debug vs release builds](#debug-vs-release-builds)
-- [GitHub Actions artifacts](#github-actions-artifacts)
-- [Known limitations](#known-limitations)
-- [Testing](#testing)
-- [Security and privacy](#security-and-privacy)
-- [Contributing and issue reports](#contributing-and-issue-reports)
+- [Testing and Releases](#testing-and-releases)
+- [Contributing and Issue Reports](#contributing-and-issue-reports)
+- [Acknowledgments](#acknowledgments)
 - [License](#license)
 
----
+## What Is PaheBatcher for Android?
 
-## Project status
+PaheBatcher for Android searches an anime library, resolves episode streams, batch-downloads
+episodes as HLS segments, assembles them into MP4 files, exports them to your device storage, and
+plays them back — with a modern, Android-native interface.
 
-| Area | State |
-|---|---|
-| Core loop (search → details → resolve → download → assemble → export → play) | **Implemented and device-verified** — see [`ANDROID_FEATURE_CATALOG.md`](ANDROID_FEATURE_CATALOG.md) for the per-feature verification tiers |
-| Direct HLS streaming playback (Phase 17) | **Implemented and device-verified** |
-| Watchlist, background episode checks, notifications | **Implemented** |
-| Settings surface (appearance, download engine, storage, notifications, diagnostics) | **Implemented** |
-| Google Play listing | **Unavailable** — the app is not published; the policy scan returns HTTP 404 for the package, as expected |
-| Play Console declarations (Data Safety, foreground-service types) | **Externally blocked** — can only be completed by the maintainer in Play Console; see [`PLAY_POLICY_FINDINGS.md`](PLAY_POLICY_FINDINGS.md) |
-| CI-signed release artifacts | **Configured** — merged PRs build signed, per-ABI release APKs + AAB in CI; signing uses the maintainer's release identity stored as repository secrets, and every artifact is signature- and ABI-verified before upload (see [GitHub Actions artifacts](#github-actions-artifacts)) |
-| Open-source license | **GPL-3.0-or-later** since 2026-10-24 - see [License](#license) |
+It is an **independent native Android implementation** (Kotlin + Jetpack Compose) of the
+desktop [PaheBatcher](https://github.com/smolfiddle/pahebatcher) project: the original application's
+behavior is the reference, while this app is written from scratch for Android. It is not a wrapper
+around a website.
 
-Per-phase completion history (phases 1–17.7 plus later audit/closure rounds) is
-recorded in [`ROADMAP.md`](ROADMAP.md); feature-by-feature Python↔Android parity is in
-[`PARITY.md`](PARITY.md).
-
----
+SmolFiddle, the author of the original desktop project, also maintains a **separate Flutter-based**
+Android app at
+[smolfiddle/pahebatcher_mobile](https://github.com/smolfiddle/pahebatcher_mobile). The two
+applications are independent implementations with different technology stacks.
 
 ## Features
 
-**Verified as reachable in the shipped UI** (every claim below corresponds to a
-registered navigation destination or a wired control in
-`pahebatcher/src/main/java/com/pahebatcher/app/ui/navigation/AppNavHost.kt`):
+- **Search & browse** — search the library from the home screen, open an anime's details page with a
+  paged episode list.
+- **Per-episode choices** — pick the audio track and quality before downloading.
+- **Downloads** — download a single episode or a batch (a whole page, everything, or a selected
+  range). Episodes arrive as HLS segments and are assembled into `.mp4`
+  files.
+- **Download queue** — live progress, pause/resume and retry, a foreground progress notification,
+  and queue records that persist in the database: after a restart the app reconciles them with
+  Android's WorkManager, and queued or interrupted work is picked up again where possible
+  (best-effort recovery — see
+  [Known Limitations](#known-limitations)).
+- **Playback** — local playback of downloaded episodes and direct HLS streaming, with media-session
+  controls, subtitles and remembered playback position.
+- **Watchlist** — follow titles and get notified when new episodes appear, via background checks.
+- **Settings** — theme and dynamic color, quality defaults, parallel-download limits, Wi-Fi-only
+  downloads, output folder, notification toggles and a diagnostics console.
 
-- **Search** — debounced search field with IME search action, offline banner,
-  results list.
-- **Anime details** — paged/lazy episode list, per-episode audio selector,
-  stream-resolution sheet, single and **batch downloads** (whole page, all, or a
-  selected range).
-- **Downloads tab** — queue with live progress, retry, pause/resume, sessions
-  screen, play button for completed episodes.
-- **Playback** — local playback of downloaded MP4s *and* direct HLS streaming,
-  with Media3 media session, media notification, next/previous, subtitles.
-- **Watchlist** — add titles, background checks for new episodes, aggregate
-  notification.
-- **Settings** — theme/dynamic color, quality (360/720/1080), parallel-download
-  and HLS-segment worker limits, scan-cache TTL, keep-temp-files, auto-retry,
-  resolve-ahead, Wi-Fi-only, auto-resume, output folder (SAF), notification
-  toggles, background-check frequency, diagnostics console.
-- **Session handling** — WebView/Cloudflare session recovery with an explicit
-  "refresh session" prompt when a quiet retry fails.
+## Download and Installation
 
-**Partial or limited** (details in [`LIMITATIONS.md`](LIMITATIONS.md)):
+No development tools required:
 
-- In-player audio/quality switching is **not** implemented (switch from the
-  details screen instead).
-- Some Android-vs-desktop differences remain documented as intentional
-  (`ANDROID_REQUIRED_DIFFERENCE` entries in [`PARITY.md`](PARITY.md)).
+1. **Get the app** - Open the latest
+   [GitHub Releases page](https://github.com/HellHarbinger/PaheBatcher-Droid/releases)
+   and download the APK matching your device's architecture:
 
-**Not provided:** no account system, no ads, no analytics, no in-app updater, no
-Play Store distribution.
+    | APK                                 | For                                        |
+    |-------------------------------------|--------------------------------------------|
+    | `pahebatcher-arm64-v8a-release.apk` | Nearly every phone and tablet (64-bit ARM) |
+    | `pahebatcher-x86_64-release.apk`    | x86_64 emulators and some Chromebooks      |
 
----
+2. **Install it** — Open the downloaded APK from your **Downloads** app or file manager.
 
-## Documentation map
+> If Android blocks the installation, the system prompt offers to allow installation from that
+> source — accept it (the wording varies between manufacturers and Android versions), then return to
+> the APK.
 
-| Document | What it holds |
-|---|---|
-| [`SPEC.md`](SPEC.md) | Product & engineering specification — the source of truth for required behavior |
-| [`ROADMAP.md`](ROADMAP.md) | Phase-by-phase completion history and exit-criteria evidence |
-| [`PARITY.md`](PARITY.md) | Feature-by-feature Python → Android parity checklist with verification status |
-| [`DECISIONS.md`](DECISIONS.md) | Numbered architectural decision log with rationale |
-| [`LIMITATIONS.md`](LIMITATIONS.md) | Platform limitations, Android workarounds, residuals (53 numbered entries) |
-| [`ANDROID_ARCHITECTURE.md`](ANDROID_ARCHITECTURE.md) | Layered architecture, packages, constraints |
-| [`ANDROID_USER_FLOWS.md`](ANDROID_USER_FLOWS.md) | End-to-end user flows as implemented |
-| [`ANDROID_FEATURE_CATALOG.md`](ANDROID_FEATURE_CATALOG.md) | Feature inventory with verification tiers (JVM / instrumented / live device) |
-| [`ANDROID_TESTING_AND_RELEASE.md`](ANDROID_TESTING_AND_RELEASE.md) | Test locations, commands, release rules |
-| [`PLAY_POLICY_FINDINGS.md`](PLAY_POLICY_FINDINGS.md) | Play-policy scan ledger (advisory, not approval) |
-| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | Third-party dependency inventory with verified licenses |
-| [`PRE_PUSH_CHECKLIST.md`](PRE_PUSH_CHECKLIST.md) | Pre-push audit: per-item status and evidence |
+3. Confirm the installation, then open the app.
 
----
+**Requirements:** Android 12L (API 32) or newer, **64-bit only** — 32-bit devices (`armeabi-v7a`,
+`x86`) are not supported.
 
-## Installing and using the release APK
+### Advanced installation
 
-> **Where do I get an installable APK?** Merged pull requests produce **signed,
-> installable** release artifacts through the workflow (see
-> [GitHub Actions artifacts](#github-actions-artifacts)). Download the artifact zip
-> from that run and pick the split matching your device's ABI. Each APK is signed with
-> the maintainer's release identity and is signature- and ABI-verified before upload,
-> so it installs directly with `adb`.
+1. **Get the app** - Open the latest
+   [GitHub Releases page](https://github.com/HellHarbinger/PaheBatcher-Droid/releases)
+2. **Pick the right file** — `arm64-v8a` for real phones and tablets; `x86_64` for x86_64 emulators.
+   > If unsure, run `adb shell getprop ro.product.cpu.abi` on your device (most report `arm64-v8a`).
+3. **Install it** — With the Android SDK platform tools you can instead install from a terminal:
 
-### Choose the APK that matches your device's CPU (ABI)
-
-Release and debug builds are split **per CPU ABI** (`splits.abi` in
-`pahebatcher/build.gradle.kts`), so each APK carries native code for exactly one ABI:
-
-| APK file | CPU ABI (download selection) | Typical devices |
-|---|---|---|
-| `pahebatcher-arm64-v8a-release.apk` | `arm64-v8a` - 64-bit ARM | Essentially every Android phone/tablet sold since ~2017 |
-| `pahebatcher-x86_64-release.apk` | `x86_64` | Default Android emulators on x86_64 hosts; a few Chromebooks |
-
-**32-bit devices (`armeabi-v7a`, `x86`) are not supported.** The media engine
-(FFmpegKit 8.1.7) ships native libraries for the two ABIs above only; the 32-bit
-stub directories a universal APK used to carry contained no FFmpeg code and would
-have crashed at runtime. The three compatibility stages, stated precisely:
-
-- **Download selection** - you pick the one APK matching your device's ABI
-  (`adb shell getprop ro.product.cpu.abi` prints it, e.g. `arm64-v8a`).
-- **Install-time** - Android compares the device ABI against the APK's packaged
-  ABIs; a mismatch fails with `INSTALL_FAILED_NO_MATCHING_ABIS`, so a wrong download
-  cannot be installed by accident.
-- **Runtime** - each per-ABI APK contains the complete FFmpegKit native set for its
-  ABI (12 libraries), so native loads cannot fail with `UnsatisfiedLinkError` on a
-  supported device.
-
-1. **Verify** the file if a SHA-256 is provided:
-   `certutil -hashfile <the-apk> SHA256` (Windows) or
-   `sha256sum <the-apk>` (Linux/macOS).
-2. **Install** with the Android SDK platform tools:
-   `adb install -r <the-apk>`
-   - The device must **not** already have a *differently signed* build of
-     `com.pahebatcher.app` installed (debug and release builds use different signing
-     identities, and Android refuses signature upgrades). Uninstalling the other build
-     **erases that build's app data** - only do it deliberately.
-3. **First run:** grant the notification permission when prompted if you want
-   download/watchlist notifications. No account or login exists.
-4. **Use it:**
-   1. Type a title on **Home** (or press the keyboard's search key) and tap a result.
-   2. On the details screen, pick an episode — the app resolves its stream and opens
-      a sheet with **Download** / **Stream**.
-   3. **Download** queues the episode; watch progress on the **Downloads** tab. A
-      foreground notification shows progress while it runs.
-   4. When an episode completes, tap **Play** on the Downloads tab, or **Stream**
-      for direct playback without downloading.
-   5. **Settings** (gear icon on Home) controls quality, parallelism, storage
-      location, and notification toggles.
-
-Downloads are written to the app-chosen folder (default: MediaStore `Movies/`, or a
-folder you pick via the system folder picker) as `.mp4` files.
-
----
-
-## Building from source
-
-**Prerequisites** (all verified against this repository):
-
-| Component | Version | Where it is declared |
-|---|---|---|
-| JDK | 25 | `JAVA_HOME` environment variable, `pahebatcher/build.gradle.kts` (`jvmToolchain(25)`) |
-| Gradle | 9.8.2 (wrapper — do not use a system Gradle) | `gradle/wrapper/gradle-wrapper.properties` |
-| Android Gradle Plugin | 9.4.1 | `gradle/libs.versions.toml` |
-| Kotlin | 2.4.20 | `gradle/libs.versions.toml` |
-| Android SDK | compileSdk/targetSdk 37, build-tools 36.0.0 | `pahebatcher/build.gradle.kts` |
-| Android device/emulator | API 32+ | `pahebatcher/build.gradle.kts` (`minSdk`) |
-
-**Commands** (Windows shown; on Linux/macOS use `./gradlew`):
-
-```powershell
-.\gradlew.bat assembleDebug                 # per-ABI debug APKs -> pahebatcher/build/outputs/apk/debug/app-<abi>-debug.apk
-.\gradlew.bat testDebugUnitTest             # JVM unit tests (debug variant)
-.\gradlew.bat testReleaseUnitTest           # JVM unit tests (release variant)
-.\gradlew.bat lintDebug                     # lint (target: 0 errors)
-.\gradlew.bat assembleDebugAndroidTest      # instrumented test APK (compile only)
-.\gradlew.bat assembleRelease bundleRelease # per-ABI release APKs (unsigned unless PB_* signing env vars are set) + AAB
+```bash
+adb install -r <apk>          # replace <apk> with the downloaded file
 ```
 
-> **Never** run `connectedDebugAndroidTest`/`connectedCheck` against a device that
-> holds real app data: Gradle uninstalls both APKs afterwards and destroys that user's
-> data. Full rules: [`ANDROID_TESTING_AND_RELEASE.md`](ANDROID_TESTING_AND_RELEASE.md)
-> §5.4.
+*(Optional)* Verify the checksum against the release's `SHA256SUMS.txt` first:
+`sha256sum <apk>` on Linux/macOS, `certutil -hashfile <apk> SHA256` on Windows.
 
----
+**Upgrading:** release builds are signed with the configured release key, so published releases
+upgrade over each other normally as long as that key is unchanged. Debug and release builds share
+the application ID `com.pahebatcher.app` but use different signing keys — Android refuses to install
+one over the other, so switching between them means uninstalling first, **which erases that build's
+app data**.
+
+## Quick Start
+
+1. **Get the app** — download the correct APK from the
+   [latest GitHub release](https://github.com/HellHarbinger/PaheBatcher-Droid/releases/latest)
+   (`arm64-v8a` for real phones and tablets, `x86_64` for emulators — see the table in
+   [Download and Installation](#download-and-installation)). Distribution is through GitHub
+   Releases, not Google Play.
+2. **Install it** — open the downloaded file and follow the prompts described in
+   [Download and Installation](#download-and-installation).
+3. **First launch** — the app opens on the **Home** tab with a search field and the bottom bar
+   (**Home** / **Downloads**). No account or login exists.
+4. **Search something** — type an anime title (or press the keyboard's search key), then tap a
+   result to open its episode list. If a "Refresh session" dialog appears, tap **Refresh now** and
+   continue.
+
+You can now tap an episode to download or stream it — see
+[How to Use](#how-to-use). Your **first download** asks Android for notification permission;
+granting it lets you follow download progress and get completion, failure and new-episode alerts.
+
+## How to Use
+
+### Search for an anime
+
+1. On the **Home** screen, type a title into the search field ("Search anime titles…") or press the
+   keyboard's search key.
+2. Results appear in a list as the query settles; an offline banner appears if the device has no
+   connection.
+3. Tap a result to open its details page, which scans and lists the available episodes (a progress
+   line shows the scan).
+
+### Choose audio and quality
+
+- **Audio:** chips at the top of the details page (e.g. `JPN`, `ENG`) apply to every episode at
+  once; an individual episode's row menu offers **Change audio** for a per-episode override. Not
+  every series has every option — unavailable audio is reported rather than silently substituted.
+- **Quality:** choose the default in **Settings → Download engine → Quality**
+  (360p / 720p / 1080p). Downloads **and** direct streaming both resolve with this quality each time
+  a stream is resolved, so set it **before** you start — changing it does not affect a download or
+  stream already in progress. There is no audio/quality switching inside the player — return to the
+  details page to switch.
+
+### Download episodes
+
+1. **One episode:** tap an episode row — the app resolves its stream and opens a panel with
+   **Download** (or **Retry download** if it failed) and **Stream**.
+2. **Several episodes:** tap the list icon in the top bar (**Select episodes**) to enter selection
+   mode, then use **Select all**, **Clear**, **From/To + Range**, or **Latest N**, and tap
+   **Download selected (N)** — or **Download this page (N episodes)** without selecting. Batches are
+   capped at 100 episodes; the count line shows your selection.
+3. The **first time you start a download**, the app asks Android for permission to post
+   notifications (you can also grant or change this later in **Settings → Notifications**). Granting
+   it lets you follow download progress, get completion and failure alerts, and receive new-episode
+   alerts from your watchlist.
+4. A batch shows a live summary (*Queued / Skipped / Failed*) and can be stopped with **Stop
+   batch** — everything already queued keeps running.
+
+### Manage downloads
+
+- Open the **Downloads** tab: each episode is a row with its current state (queued, downloading,
+  assembling, completed or failed) and live progress.
+- Per-row actions: **Pause**, **Resume**, **Cancel**, **Retry** — and **Play** once an episode is
+  completed. Failed rows stay listed with their reason until retried or cancelled.
+- If a completed file already exists where a new one would be written, the app asks before replacing
+  it.
+
+### Play and stream
+
+- **Play** (Downloads tab) plays the finished local MP4 — no connection needed.
+- **Stream** (on the details page panel) plays the episode directly over HLS **without writing a
+  video file to your device** — playback is buffered in memory while you watch. It needs a working
+  session and connection.
+- The player offers seek, previous/next episode, subtitles and a Retry overlay on failure; your
+  playback position is remembered.
+
+### Watchlist and settings
+
+- **Watchlist:** from the **Home** top bar, tap the **Watchlist** icon (a list icon), paste an
+  anime's page URL into **Anime URL** and tap **Add**. The app then checks for new episodes in the
+  background (frequency set in Settings) and posts a single combined notification; the refresh icon
+  (**Check now for new episodes**) runs a check on demand, and **Remove** deletes an entry.
+- **Settings:** tap the gear icon on **Home** — see
+  [Settings and Configuration](#settings-and-configuration).
+
+## Settings and Configuration
+
+| Section               | Key options                                                                                                                                                            |
+|-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Appearance**        | Theme (`System` / `Dark` / `Light`), dynamic color                                                                                                                     |
+| **Download engine**   | Quality (360p / 720p / 1080p), max parallel downloads, HLS segment workers, scan cache TTL, keep temp files, auto retry (None / Once / Twice), Wi-Fi-only, auto-resume |
+| **Storage**           | Output location — use the default or pick a folder with the system picker                                                                                              |
+| **Notifications**     | Notification permission, completion / failure / new-episode toggles                                                                                                    |
+| **Background checks** | Watchlist check frequency (15 min – 12 h)                                                                                                                              |
+| **Diagnostics**       | In-app console for support and troubleshooting                                                                                                                         |
+
+Settings apply from the next action onward (the next queueing, resolution or notification) —
+already-running work is unaffected.
+
+## Where Downloads Are Saved
+
+- Finished episodes are exported as `.mp4` files to **`Movies/<anime title>/`** in device storage by
+  default, where your gallery and file manager can see them.
+- Choose a different folder in **Settings → Storage → Output location** (system folder picker).
+- Temporary segment data is kept inside the app's private storage during a download and cleaned up
+  after assembly (unless *Keep temp files* is enabled).
+
+## Known Limitations
+
+- **Website session / Cloudflare** — the site session is maintained through a WebView and is
+  inherently fragile; when a quiet refresh fails, the app shows a *Refresh session* dialog
+  (**Refresh now** / **Not now**).
+- **No in-player audio or quality switching** — switch from the details page instead.
+- **64-bit only** — release APKs are split per ABI and ship `arm64-v8a` and `x86_64`
+  native libraries only.
+- **Background execution** — Android throttles long-running background work, so very long queues can
+  be deferred to when the app is in the foreground, and scheduled watchlist checks may run later
+  than the chosen interval (Android's periodic scheduling is inexact).
+- **Not on Google Play** — distribution is via GitHub releases only.
+
+The full list with workarounds lives in [`LIMITATIONS.md`](LIMITATIONS.md).
+
+## Documentation
+
+| Document                                                           | Purpose                                            |
+|--------------------------------------------------------------------|----------------------------------------------------|
+| [`SPEC.md`](SPEC.md)                                               | Project specification — required behavior          |
+| [`LIMITATIONS.md`](LIMITATIONS.md)                                 | Known platform limitations and workarounds         |
+| [`PARITY.md`](PARITY.md)                                           | Feature-by-feature parity with the desktop project |
+| [`ANDROID_USER_FLOWS.md`](ANDROID_USER_FLOWS.md)                   | End-to-end user flows, screen by screen            |
+| [`ANDROID_ARCHITECTURE.md`](ANDROID_ARCHITECTURE.md)               | Technical architecture                             |
+| [`ANDROID_TESTING_AND_RELEASE.md`](ANDROID_TESTING_AND_RELEASE.md) | Testing and release procedures                     |
+| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)                 | Third-party dependency licenses                    |
+
+## Building from Source
+
+**Prerequisites:** JDK 25, the Android SDK (compileSdk 37), and the bundled Gradle wrapper (9.8.2) —
+build only through the wrapper.
+
+```bash
+./gradlew assembleDebug       # per-ABI debug APKs -> pahebatcher/build/outputs/apk/debug/
+./gradlew testDebugUnitTest   # JVM unit tests
+./gradlew lintDebug           # Android lint (target: 0 errors)
+```
+
+On Windows use `.\gradlew.bat` instead of `./gradlew`. Test locations, release rules and cautions
+(for example, never run connected tests against a device holding real app data) are documented in
+[`ANDROID_TESTING_AND_RELEASE.md`](ANDROID_TESTING_AND_RELEASE.md).
 
 ## Architecture
 
-Single-Activity Jetpack Compose app with a strict layering
-(full detail: [`ANDROID_ARCHITECTURE.md`](ANDROID_ARCHITECTURE.md)):
+Single-activity Jetpack Compose app with a strict layering — UI → ViewModel → use cases /
+repositories → pure-Kotlin domain logic → implementations (Room, OkHttp + WebView session, HLS
+engine, WorkManager, Media3). Background downloads run under WorkManager with a foreground progress
+notification; state lives in the database and is reconciled with WorkManager after a restart —
+recovery is best-effort, not guaranteed (see [`LIMITATIONS.md`](LIMITATIONS.md)). Full detail:
+[`ANDROID_ARCHITECTURE.md`](ANDROID_ARCHITECTURE.md).
 
-```
-UI (Compose screens + navigation)         ui/, MainActivity
-        |  state flows only
-ViewModel (UI state, user intents)        ui/*ViewModel
-        |  suspend calls
-Use cases / repositories                  data/repository/, data/download/
-        |  domain types
-Domain logic (pure Kotlin)                domain/
-        |  ports
-Implementations                           data/local (Room), data/remote (OkHttp/WebView),
-                                          data/hls (HLS engine), worker/ (WorkManager),
-                                          playback/ (Media3), notification/
-```
+**Technology:** Kotlin · Jetpack Compose (Material 3) · Navigation-Compose · Room · DataStore ·
+WorkManager · OkHttp · AndroidX Media3 (ExoPlayer) · FFmpegKit
 
-- **Composition root / DI:** `di/AppContainer.kt` (manual, no DI framework).
-- **Persistence:** Room (episode/download/watchlist state) + DataStore (settings);
-  WorkManager owns background download execution.
-- **Networking:** OkHttp for HTTP; a WebView-backed session layer handles the
-  Cloudflare/site session and is the only component that loads the source site.
-- **Concurrency:** bounded throughout (HLS segment workers and parallel episode
-  downloads are semaphore/limiter-controlled; no unbounded coroutines).
-- **Background:** WorkManager `DownloadWorker` runs as a `dataSync` foreground
-  service with a real progress notification; playback uses a Media3
-  `MediaSessionService` (`mediaPlayback` type).
+## Testing and Releases
 
----
+- Unit tests (`testDebugUnitTest`, `testReleaseUnitTest`) and `lintDebug` run on every merged pull
+  request and gate the release build; test locations and commands are in
+  [`ANDROID_TESTING_AND_RELEASE.md`](ANDROID_TESTING_AND_RELEASE.md).
+- On a merge to `main`, CI builds per-ABI **signed** release APKs and an AAB, verifies the
+  signatures, and publishes them — together with `SHA256SUMS.txt` — to a
+  [GitHub Release](https://github.com/HellHarbinger/PaheBatcher-Droid/releases). Nothing is uploaded
+  to Google Play.
 
-## How the main flows work
+## Contributing and Issue Reports
 
-### Search
+- Read [`SPEC.md`](SPEC.md) first — it, not the desktop code, defines required behavior; development
+  conventions are in [`AGENTS.md`](AGENTS.md).
+- Make the smallest complete, verified increment: build, run the relevant tests, and update the
+  documentation you affect.
+- **Issues:** include (1) exact steps to reproduce, (2) expected vs actual behavior, (3) app version
+  and build variant, and (4) your device's Android version. Never attach keystores, credentials,
+  cookies or session data.
 
-```
-[Home search field] --IME Search / debounce 350 ms--> HomeViewModel
-        |                                              |  (viewModelScope, cancels stale query)
-        |                                              v
-        |                                   search repository -> HTTP
-        |                                              |
-        v                                              v
-   results list  <----------- SearchUiState (StateFlow) ------ collectAsStateWithLifecycle
-```
+## Acknowledgments
 
-### Search result interaction
+PaheBatcher for Android would not exist without the original desktop
+[PaheBatcher](https://github.com/smolfiddle/pahebatcher) project, authored by
+[SmolFiddle](https://github.com/smolfiddle). Their work and guidance were of great value at multiple
+stages of this project's development, and we are deeply grateful for the foundation and inspiration
+they provided.
 
-```
-[tap result row] --> navigate(AnimeDetailsRoute(session))
-                          |
-                          v
-                AnimeDetailsViewModel.load(session)
-                          |   EpisodeRepository: paged episode list + audio options
-                          v
-                [Details screen: episode rows, audio selector, batch controls]
-                          |
-        +-----------------+------------------+
-        | tap episode (resolve)             | batch: page / all / selected
-        v                                   v
-  selectEpisode()                    enqueue downloads directly
-```
+The PaheBatcher logo used by this application was created collaboratively by this project's
+maintainer and SmolFiddle. Both the Kotlin-based Android application in this repository and
+SmolFiddle's separate Flutter application use this shared logo.
 
-### Resolution
-
-```
-selectEpisode(episode)
-      |
-      v
-resolve stream chain:  play page  ->  Kwik  ->  M3U8 playlist
-      |                   (rotation-safe URL handling, JS unpacking, quality/audio selection)
-      v
-resolution sheet:  "Resolving..."  ->  [Download] [Retry download] [Stream]
-      |
-      +--> Download  -> DownloadRepository.queueResolvedEpisode(...)   (see below)
-      +--> Stream    -> navigate(PlayerRoute(episodeId, mode=STREAM))
-```
-
-### Download, persistence and assembly
-
-```
-DownloadRepository.queueResolvedEpisode
-      |   Room row: QUEUED -> RESOLVING (CAS updates, segment folder staged)
-      v
-WorkManager.enqueueUniqueWork("download")
-      |
-      v
-DownloadWorker (foreground service, type=dataSync, progress notification)
-      |   claims the row with a run-token (crash-safe ownership)
-      v
-EpisodeDownloader  -- HlsPlaylistParser --> segment list
-      |   bounded concurrency (HLS workers), AES-128 decryption
-      v
-SegmentFileStore   -- atomic per-segment writes (partial != completed)
-      |
-      v
-FfmpegEpisodeAssembler (FFmpegKit)  --> single .mp4 (remux, no re-encode)
-      |
-      v
-EpisodeExporter  -- ExportDestinationRouter --> MediaStore (Movies/) or SAF folder
-      |
-      v
-Room state -> DOWNLOADING -> COMPLETED / FAILED  + notification (complete/failure)
-```
-
-State lives in Room, so the queue **survives process death, reboot and network
-interruption**: `DownloadStateReconciler` re-checks WorkManager `WorkInfo` against
-database rows on startup and repairs drift. An optional Wi-Fi-only constraint and
-auto-resume setting gate re-execution.
-
-### Export
-
-```
-ExportOutcome <- EpisodeExporter.export()
-      |-- MediaStoreExporter : inserts into MediaStore (Movies/), RELATIVE_PATH honored
-      `-- SafExporter        : writes into the user-picked folder (SAF tree)
-            (router picks the destination from settings/permissions)
-```
-
-### Playback
-
-```
-PlayerRoute(episodeId, mode)
-      |
-      +-- mode=DOWNLOAD : load local completed MP4s -> ExoPlayer playlist
-      `-- mode=STREAM   : reconstruct play URL -> direct HLS -> ExoPlayer
-      |
-      v
-PlayerViewModel  owns ONE ExoPlayer per screen entry + Media3 MediaSession
-      |
-      v
-PaheMediaSessionService (mediaPlayback FGS)
-      `-- media3 owns the media notification, session controls and FGS promotion;
-          foreign media controllers are rejected by MediaSessionControllerPolicy
-```
-
-Notification taps deep-link back into the player
-(`player:<episodeId>:<mode>` is parsed by `PlayerTarget`).
-
-### Settings and notifications
-
-```
-SettingsScreen  --> DataStore preferences --> consumed by
-        |                                     - DownloadWorker / EpisodeDownloader (quality, workers, retry)
-        |                                     - WifiOnlyConstraint / auto-resume
-        |                                     - WatchlistNotificationManager / background checks
-        `-- diagnostics console (ConsoleRoute) reads the bounded in-app log buffer
-
-Notification channels:
-  download_progress   (foreground-service progress, while downloading)
-  download_complete   (episode ready)
-  download_failure    (retryable/permanent failure)
-  watchlist_new_episodes (aggregate "new episode" digest)
-  + media3's own playback notification (from PaheMediaSessionService)
-```
-
----
-
-## Debug vs release builds
-
-| | Debug | Release |
-|---|---|---|
-| Signing | Android debug key | **Maintainer's release identity**, applied via the env-gated `signingConfigs.release` block (`PB_*` variables, fail-closed - see [`signing.env.example`](signing.env.example); no key material in the repo). For merged PRs, CI sets these from repository secrets, so **release builds are signed** |
-| Validation overlay + spike validators (`KwikValidator`, `OkHttpValidator`, `WebViewSessionValidator`) | present in `pahebatcher/src/debug/` | **absent** — release compiles a documented no-op seam (`pahebatcher/src/release/…/ValidationOverlayEntry.kt`) |
-| Test-only components (`PBGrantProbeActivity`, `PBTestDocumentsProvider`) | present (debug manifest only) | **absent** |
-| `android:networkSecurityConfig` (cleartext for `127.0.0.1` test fixture) | yes (debug manifest) | **absent** |
-| Debuggable | yes | **no** (verified in the packaged release APK) |
-| Validation screen reachable? | yes — `BuildConfig.DEBUG` gates the overlay in `MainActivity` | **never** — both the call site and the setter are `BuildConfig.DEBUG`-gated, and the release seam is a no-op |
-| Diagnostic logcat logging | on | off (`AppLog` diagnostics default to `BuildConfig.DEBUG`; failure logs still work) |
-
-The debug build additionally exposes the validation screen from the Home screen
-(long-press); that path cannot exist in release. Both variants share the same
-application id `com.pahebatcher.app`, so **debug and release are mutually exclusive
-installs** (different certificates).
-
----
-
-## GitHub Actions artifacts
-
-Workflow: [`.github/workflows/release-artifacts.yml.bak`](.github/workflows/release-artifacts.yml.bak)
-
-| Aspect | Behavior |
-|---|---|
-| Trigger | `pull_request` **closed** targeting `main` — runs **only if the PR was merged**; a closed-unmerged PR produces nothing. Deliberately **no** `push` and **no** `workflow_dispatch` trigger: signed artifacts come only from a merged PR. |
-| Commit built | the PR's merge commit (`merge_commit_sha`), i.e. the merged base-branch commit |
-| Verification gates | three independent jobs — `testDebugUnitTest`, `testReleaseUnitTest`, `lintDebug` — must all pass before the build job runs; each can be re-run in isolation from the *Actions* UI |
-| Build tasks | `assembleRelease` + `bundleRelease` |
-| Signing | **signed** — the build job reconstructs the maintainer's keystore from four repository secrets (`PB_KEYSTORE_BASE64`, `PB_KEYSTORE_PASSWORD`, `PB_KEY_ALIAS`, `PB_KEY_PASSWORD`) and fails closed if any is missing or invalid. The keystore lives only in runner temp and is deleted in an unconditional cleanup step. Only the build job sees secrets; verification jobs never do. |
-| Post-build verification | `apksigner` (APK signature validity, identical signer certificate across all outputs, per-ABI native-library purity) + `jarsigner` (AAB) + SHA-256 checksums; Gradle success alone is never trusted |
-| Artifact name | `PaheBatcher-release-v<version>-code<N>-<short-sha>` |
-| Contents | per-ABI **signed** APKs (arm64-v8a, x86_64), signed AAB, `SHA256SUMS.txt`, `build-metadata.json` (commit, version, toolchain, run URL) |
-| Retention | 90 days (explicit) |
-| Permissions | `contents: read` only |
-| Not done | no GitHub Release is created, nothing is uploaded to Google Play |
-
-**Obtaining artifacts:** merge a pull request into `main`, then download the artifact
-zip from that run's summary page in the *Actions* tab (*Release artifacts (merged PR)*).
-The zip contains per-ABI **signed** APKs plus the signed AAB, their SHA-256 checksums
-and build metadata. Pick the APK matching your device's ABI (see
-[Installing and using the release APK](#installing-and-using-the-release-apk)), verify
-its SHA-256 against `SHA256SUMS.txt`, and install it with `adb install -r`. Signing is
-fail-closed and env-gated (`signingConfigs.release` driven by the `PB_*` variables —
-see [`signing.env.example`](signing.env.example)); the four signing secrets are
-configured once by the maintainer as repository secrets and never committed. The
-keystore is reconstructed only inside the build job and deleted in an unconditional
-cleanup step, so no key material is retained.
-
----
-
-## Known limitations
-
-The full, numbered list with workarounds and evidence is
-[`LIMITATIONS.md`](LIMITATIONS.md) (53 entries). Highlights:
-
-- **Cloudflare / site session** — session handling runs in a WebView; it is fragile
-  by nature, and some findings are explicitly deferred (`LIMITATIONS.md` §1, §25).
-- **TLS fingerprinting** — native HTTP cannot perfectly mimic a browser; the WebView
-  session layer exists to compensate (§2).
-- **In-player audio/quality switching** — not implemented; switch from the details
-  screen (§31, catalog notes).
-- **32-bit devices** — the release APK packages the FFmpeg native libraries for
-  `arm64-v8a` and `x86_64` only; on `armeabi-v7a`/`x86` devices in-app assembly may
-  fail (verified from the packaged APK's `lib/` contents).
-- **Background execution & quotas** — Android may throttle long-running foreground
-  work; observed FGS quota timeouts are recorded (§4).
-- **Storage semantics** — MediaStore and the app database are not atomic together;
-  crash between them can leave a repaired-but-not-identical state (§18).
-- **Posters** — poster image source is unverified against the desktop tool (§17).
-- **Process death** — handled via reconciliation, but recovery paths are inherently
-  best-effort (§6).
-- **Touch targets** — some controls are 40dp instead of the 48dp guideline (§19).
-
----
-
-## Testing
-
-Evidence scope for the **2026-10-24 pre-push round** (details in
-[`PRE_PUSH_CHECKLIST.md`](PRE_PUSH_CHECKLIST.md)):
-
-| Layer | Result | When |
-|---|---|---|
-| JVM unit tests, debug variant | **115 suites / 1,248 tests / 0 failures / 0 errors / 0 skipped** | 2026-10-24 (fresh run) |
-| JVM unit tests, release variant | **114 suites / 1,243 tests / 0 failures / 0 errors / 0 skipped** | 2026-10-24 (fresh run) |
-| Android lint (debug) | **0 errors**, 41 warnings + 1 note (all pre-existing, none in changed files) | 2026-10-24 (fresh run) |
-| Instrumented / on-device | **not re-run in this round**; last recorded device rounds: 300 tests passing across six runs (2026-10-23) | see [`ROADMAP.md`](ROADMAP.md) / [`PARITY.md`](PARITY.md) |
-| Release APK on device | **not tested in this round** — blocked by the debug/release signature conflict (documented, needs approval) | see `PRE_PUSH_CHECKLIST.md` |
-
-Longer-term evidence lives in [`ANDROID_FEATURE_CATALOG.md`](ANDROID_FEATURE_CATALOG.md):
-**24 features verified by instrumented device runs**, **16 by JVM tests**,
-**18 by live device journeys**, plus dated historical runs in `ROADMAP.md`.
-
-Test rules of the project: never weaken a test to get a pass, every non-trivial
-subsystem keeps tests, and process-interrupt/resume behavior is explicitly tested.
-
----
-
-## Security and privacy
-
-- **Permissions declared by the app:** `INTERNET`, `POST_NOTIFICATIONS`,
-  `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC`,
-  `FOREGROUND_SERVICE_MEDIA_PLAYBACK`. The merged release manifest additionally
-  carries `ACCESS_NETWORK_STATE`, `WAKE_LOCK` and `RECEIVE_BOOT_COMPLETED` (declared
-  by the bundled libraries: WorkManager/Media3) — verified against the packaged APK.
-- **No data collection:** no analytics, crash, advertising or tracking SDK exists in
-  `gradle/libs.versions.toml`. Nothing is sent anywhere except the source site the
-  app operates on, to fetch the content you asked for.
-- **No account, no identity:** there is no login and no personal-data collection —
-  the policy scan's "User Account and Identity" goal returned zero findings.
-- **Backups disabled:** `android:allowBackup="false"` (verified in the packaged
-  release manifest).
-- **Logging:** diagnostic logging is compiled out of release by default; cookies,
-  tokens and credentials must never be logged (project rule in `AGENTS.md` §10).
-- **Secrets:** no keystores, passwords or tokens are committed; the release signing
-  identity lives outside the repository and is never read by CI.
-- **Policy scan:** [`PLAY_POLICY_FINDINGS.md`](PLAY_POLICY_FINDINGS.md) records two
-  runs of the `play-policy-insights` audit (both 🟢 compliant, advisory only) and the
-  two Play Console declarations only the maintainer can submit. **It does not
-  guarantee Play Store approval.**
-
-- **Privacy and personal-data redaction:** before this repository's first
-  publication, device identifiers (test-device serial/model), machine-local
-  absolute paths and account names were replaced with neutral placeholders
-  (`REDACTED-SERIAL`, `REDACTED-MODEL`, `<repo-root>`, `<TEMP>`,
-  `<USERPROFILE>`, `<python-ref-X.Y.Z>`, `<mubeng-dir>`) across all documents,
-  tests and scripts; helper scripts read such values from environment
-  variables instead. Historical evidence records were rewritten in place with
-  these placeholders - their substance (what was tested and how) is unchanged.
-
----
-
-## Contributing and issue reports
-
-There is no separate contributing guide yet; the de-facto project policy (documented
-in [`AGENTS.md`](AGENTS.md)) is:
-
-- Read `SPEC.md` first — it, not the desktop code, defines required behavior for new
-  work; the Python repository is the behavioral reference.
-- Make the **smallest complete, verified increment**: build, run the relevant tests,
-  and record evidence. Never weaken tests, never ship placeholders or fake data.
-- Keep the frozen search/IME/Cloudflare JSON path untouched unless a proven defect
-  requires a stop-and-report first.
-- Update the documentation you affect (`PARITY.md`, `DECISIONS.md`, `LIMITATIONS.md`,
-  `ROADMAP.md` as appropriate).
-
-**Issues:** open an issue describing (1) exact steps to reproduce, (2) expected vs
-actual behavior, (3) build variant (debug/release) and app version, and (4) device
-Android version. Never attach keystores, credentials, cookies, session data or other
-personal information.
-
----
+> **Looking for the Flutter app?** SmolFiddle's separate Flutter-based Android
+> implementation is
+> at [smolfiddle/pahebatcher_mobile](https://github.com/smolfiddle/pahebatcher_mobile)
+> — an independent project from this repository, with its own README, releases and
+> support channels.
 
 ## License
 
-**GPL-3.0-or-later.** PaheBatcher for Android, Copyright (C) 2026 HellHarbinger,
-is licensed under the GNU General Public License version 3 or (at your option)
-any later version. The complete license text is in [`LICENSE`](LICENSE)
-(notice header + the unmodified official FSF text); third-party components keep
-their own licenses, inventoried in
+PaheBatcher for Android is licensed under **GPL-3.0-or-later** — see
+[`LICENSE`](LICENSE) for the full terms. You are free to run, study, share and modify it; derivative
+works must be distributed under the same license, and there is no warranty. Third-party components
+keep their own licenses, inventoried in
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-
-In short: you are free to run, study, share and modify this software, and
-derivative works must also be distributed under GPL-3.0-or-later. There is
-**no warranty**; see the license text for the full terms.

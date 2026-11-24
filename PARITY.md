@@ -14,7 +14,7 @@
 
 **Phase 3: Models, Configuration, and Persistence — COMPLETED**
 
-> *Symbol/schema note (pre-Phase-11 reconciliation): some component names in this historical phase snapshot were later renamed or removed; the current Room schema is version **3** with `SegmentEntity` removed (see §9.3).*
+> *Symbol/schema note (pre-Phase-11 reconciliation): some component names in this historical phase snapshot were later renamed or removed; the current Room schema is version **5** with `SegmentEntity` removed (see §9.3).*
 
 Implemented components:
 - Domain models: `EpisodeInfo`, `AnimeInfo`, `StreamInfo`, `AppContext` (direct port from Python `models.py`)
@@ -570,8 +570,8 @@ Implemented components:
 - Defaults match Python reference exactly — and since Phase 12A they are the SAME values the background worker runs with: `DownloadConfig.from(AppContext)` maps the persisted snapshot (`max_parallel`, `hls_workers`, `auto_retry`, `keep_temp`) and `DownloadConfig.maxParallel` now defaults to 2, retiring the pre-12A "documented intentional divergence" (worker default 3) recorded in §9.2 (DECISIONS 83)
 
 **Room Database Persistence:**
-- Implemented `PaheDatabase` with **version 3 schema** [**SUPERSEDED 2026-10-22**: the current schema is **version 4** — `PaheDatabase.kt:52`; `MIGRATION_3_4` adds `EpisodeDownloadEntity.replaceRequested`/`replacePriorUri` for the Replace-file feature (DECISIONS 152); it was added with no destructive fallback — `PaheDatabase.kt:40-41`. The v1→v2→v3 migration history below stands as written; at the time of writing v3 was the current schema.] (`MIGRATION_1_2` drops the `segments` table and adds `m3u8Url`/`userAgent`/`referer`/`segmentDir` columns — see PHASE10_ARCHITECTURE_V10.md §1; `MIGRATION_2_3` adds the nullable `outputUri` column and the `playback_position` table — PHASE11_ARCHITECTURE_V2 §29, added by Phase 11)
-- Entities (v3 list; unchanged at v4 — the v4 migration only adds columns to `EpisodeDownloadEntity`, the five-entity set below is still the current set):
+- Implemented `PaheDatabase` with **version 3 schema** [**SUPERSEDED 2026-10-22**: at that correction the current schema was **version 4** — `PaheDatabase.kt:52` as cited then; the current schema is **version 5** — `PaheDatabase.kt:59` (`version = 5`), with `MIGRATION_4_5` adding nullable `episode_downloads.downloadRunId` (DECISIONS 164); `MIGRATION_3_4` adds `EpisodeDownloadEntity.replaceRequested`/`replacePriorUri` for the Replace-file feature (DECISIONS 152); it was added with no destructive fallback — `PaheDatabase.kt:40-41`. The v1→v2→v3 migration history below stands as written; at the time of writing v3 was the current schema.] (`MIGRATION_1_2` drops the `segments` table and adds `m3u8Url`/`userAgent`/`referer`/`segmentDir` columns — see PHASE10_ARCHITECTURE_V10.md §1; `MIGRATION_2_3` adds the nullable `outputUri` column and the `playback_position` table — PHASE11_ARCHITECTURE_V2 §29, added by Phase 11)
+- Entities (v3 list; unchanged at v4/v5 — those migrations only add columns to `EpisodeDownloadEntity`, the five-entity set below is still the current set):
   - `ScanCacheEntity`: Replaces Python `_scan_cache.json` files
   - `DownloadSessionEntity`: Replaces Python `session.json` files (note: earlier revisions of this document called it `SessionEntity` — the actual class is `DownloadSessionEntity`)
   - `EpisodeDownloadEntity`: Tracks per-episode download state
@@ -1289,4 +1289,4 @@ Pending user decisions are enumerated in DECISIONS 159.5 — nothing was silentl
 
 Device runs for this round (2026-10-23): 43 + 134 + 95 + 26 + 1 + 1 = 300 tests passing across six runs; JVM Debug 114 classes / 1,236 tests and Release 113 / 1,231, all 0 failures, 0 errors, 0 skipped (fresh rerun 2026-10-23); lintDebug + lintRelease 0 errors, 0 fatal (fresh rerun 2026-10-23). Push readiness, public-release security and release signing are separate gates assessed in their own rounds - deliberately NOT merged into this parity addition.
 
-[Back to Index](Index.md)
+[Back to Index](README.md)

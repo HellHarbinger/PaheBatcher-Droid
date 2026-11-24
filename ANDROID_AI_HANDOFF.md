@@ -103,7 +103,7 @@ day-to-day answers):
 │   │   ├── export\                     # EpisodeExporter, MediaStoreExporter, SafExporter,
 │   │   │                               # ExportDestinationRouter, ExportFileNames, FileNameGenerator
 │   │   ├── session\                    # AndroidCloudflareSession (WebView owns Cloudflare)
-│   │   ├── local\                      # PaheDatabase v4 (Room), entities, DAOs, reconciler
+│   │   ├── local\                      # PaheDatabase v5 (Room), entities, DAOs, reconciler
 │   │   ├── repository\                 # SessionActions, EpisodeRepository, WatchlistChecker
 │   │   ├── playback\                   # PlaybackSourceResolver, position tracking
 │   │   ├── stream\                     # StreamResolver (quality/audio variant resolution)
@@ -116,14 +116,14 @@ day-to-day answers):
 │   │                                   # sessionprompt, watchlist, settings, player, navigation
 │   ├── notification\                   # DownloadNotificationManager, DownloadRowMapper
 │   └── worker\                         # DownloadWorker (WorkManager), WatchlistCheckWorker
-├── pahebatcher\src\test\                       # JVM unit tests (~109 suites)
+├── pahebatcher\src\test\                       # JVM unit tests (~115 suites)
 ├── pahebatcher\src\androidTest\                # on-device instrumented suites
-├── scripts\check-doc-citations.ps1     # documentation citation validator
+├── (scripts\ restored locally 2026-11-14 but gitignored — check-doc-citations.ps1 not in the repo, see §7)
 └── (docs listed in section 3)
 ```
 
 Build facts (verify in `pahebatcher\build.gradle.kts` before relying on numbers): package
-`com.pahebatcher.app`, minSdk 32, compileSdk/targetSdk 37, JDK 25, versionName `0.1.0`.
+`com.pahebatcher.app`, minSdk 32, compileSdk/targetSdk 37, JDK 25, versionName `0.2.0`.
 
 ## 5. How to trace a user-visible feature
 
@@ -209,10 +209,10 @@ adb -s <serial> shell am instrument -w -e class com.pahebatcher.app.data.export.
 Run one instrumented class per invocation (comma-separated lists honor only the first class).
 `#methodName` suffixes work for a single test method.
 
-Documentation validation after ANY doc edit:
+Documentation validation (the citation checker was removed from the repo on 2026-10-24 and restored locally 2026-11-14 — gitignored, so absent from a fresh clone):
 
 ```powershell
-powershell -File scripts\check-doc-citations.ps1
+# scripts\check-doc-citations.ps1 is gitignored (restored locally 2026-11-14) — validate FILE:NNNN citations manually in a clone
 ```
 
 ## 8. Safe physical-device testing (secondary user)
@@ -245,8 +245,8 @@ Full checklist and evidence rules: `ANDROID_TESTING_AND_RELEASE.md`.
 ## 9. Documentation and citation maintenance
 
 - Every `file:line` citation in the four audit docs (`DECISIONS.md`, `ROADMAP.md`,
-  `LIMITATIONS.md`, `PARITY.md`) must point at a real location. The repo ships a validator;
-  run it after every doc edit and fix what it reports. Citations must remain valid after
+  `LIMITATIONS.md`, `PARITY.md`) must point at a real location. (The repo's citation validator
+  was gitignored with `scripts/` on 2026-10-24 (restored locally 2026-11-14, still absent from a fresh clone) — validate manually after every doc edit.) Citations must remain valid after
   subsequent code edits — when line numbers drift, repoint the citation (do not delete the
   history around it).
 - `DECISIONS.md` is append-mostly: new numbered decisions; historical entries are not
@@ -301,5 +301,5 @@ When continuing development:
 2. Reproduce current behavior first (tests or device) before changing it.
 3. Add or extend a regression test for every behavior change.
 4. Build (`assembleDebug`), run the affected suites, then the full JVM suite before finishing.
-5. Update the four audit docs (append-only rules in section 9) and re-run the citation checker.
+5. Update the four audit docs (append-only rules in section 9) and re-validate their citations manually or with the local `scripts/check-doc-citations.ps1` (removed from the repo 2026-10-24, restored locally 2026-11-14, gitignored).
 6. Never trade a smaller verified change for a larger unverified one.

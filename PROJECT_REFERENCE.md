@@ -20,8 +20,9 @@
 - **Canonical sources:** purpose/entry handoff → `ANDROID_AI_HANDOFF.md`; product requirements →
   `SPEC.md`; process rules (binding) → `AGENTS.md`.
 - **Current status:** all implementation phases through the 2026-10-21 closure rounds are recorded
-  COMPLETE/CLOSED in `ROADMAP.md` (see §10). The application builds, the JVM test gate, lint gate,
-  and citation gate pass as of the last recorded round (`ROADMAP.md:2194-2206`).
+  COMPLETE/CLOSED in `ROADMAP.md` (see §10). The application builds; the JVM test and lint gates
+  pass as of the last recorded ROADMAP entry (`ROADMAP.md:2226-2227`) — the citation checker
+  itself was removed with `scripts/` on 2026-10-24 and restored locally 2026-11-14 (still gitignored — not in the repository or on GitHub).
 - **Not 100% parity:** `PARITY.md` is authoritative for verified parity and intentional deviations;
   open gaps are listed in §4 and §8 below.
 
@@ -30,8 +31,8 @@
 **Canonical source:** `ANDROID_ARCHITECTURE.md` (layer diagram at `:44-73`, package ownership table
 at `:116-143`). Data/schema ownership: `ANDROID_DATA_AND_STATE.md`.
 
-- Single Gradle module `app`, package `com.pahebatcher.app`; source sets `main` (146 .kt),
-  `test` (114), `androidTest` (110), `debug` (7, validation spikes), `release` (1).
+- Single Gradle module `pahebatcher`, package `com.pahebatcher.app`; source sets `main` (146 .kt),
+  `test` (115), `androidTest` (112), `debug` (7, validation spikes), `release` (1).
 - **Layering is UI → ViewModel → domain/use-case role → Repository → domain implementation →
   platform engine**, as required by `AGENTS.md` §4. The use-case role is embodied by domain classes
   (e.g. `domain/watchlist/WatchlistChecker.kt:135` — the one shared use case for the Watchlist
@@ -45,8 +46,8 @@ at `:116-143`). Data/schema ownership: `ANDROID_DATA_AND_STATE.md`.
 - **Session:** `data/session/AndroidCloudflareSession.kt` (single non-window WebView, states
   NOT_STARTED→ESTABLISHING→ESTABLISHED with EXPIRED/FAILED); `AndroidSessionPersistence` stores
   metadata only — no raw cookies are persisted.
-- **Database:** Room `data/local/PaheDatabase.kt:43-54` — **version 4**, `exportSchema = true`,
-  5 entities, 5 DAOs, migrations 1→2→3→4, no destructive fallback.
+- **Database:** Room `data/local/PaheDatabase.kt:50-61` — **version 5**, `exportSchema = true`,
+  5 entities, 5 DAOs, migrations 1→2→3→4→5, no destructive fallback.
 - **Download engine:** `worker/DownloadWorker.kt:59` (CoroutineWorker, FGS `dataSync`, CAS entry
   claim) drives `data/hls/EpisodeDownloader.kt:49` (bounded semaphore, consumes already-resolved
   `StreamInfo`); foreground orchestration + admission gate in `data/download/DownloadRepository.kt`.
@@ -115,7 +116,7 @@ settings (18 rows), process-death reconciliation.
 
 ## 5. Important architectural invariants
 
-**Canonical sources:** `ANDROID_ARCHITECTURE.md:613-643` (8 constraints), `ANDROID_DATA_AND_STATE.md:357-390`
+**Canonical sources:** `ANDROID_ARCHITECTURE.md:627-657` (8 constraints), `ANDROID_DATA_AND_STATE.md:358-391`
 (12 test-pinned invariants), plus `AGENTS.md` rules 4–13 and 17. Summary (pointers, not copies):
 
 1. Cloudflare-protected requests only via the WebView session; OkHttp never bypasses it.
@@ -136,23 +137,26 @@ settings (18 rows), process-death reconciliation.
 ## 6. Current testing and release workflow
 
 **Canonical source:** `ANDROID_TESTING_AND_RELEASE.md` (self-dated 2026-10-18) + `AGENTS.md` §7/§8/§20.
-Where counts of record are needed, cite `ROADMAP.md` (latest round) rather than the handbook snapshot.
+Where counts of record are needed, cite the latest recorded round's evidence (`ROADMAP.md` for the
+rounds it records; `PRE_PUSH_CHECKLIST.md` / `DECISIONS.md` for the 2026-10-24 pre-push round)
+rather than the handbook snapshot.
 
-- **Toolchain (verified against build files):** JDK 25, Gradle 9.7.1, AGP 9.4.1, Kotlin 2.4.20,
-  KSP 2.3.12, compileSdk/targetSdk 37, minSdk 32 (`gradle/libs.versions.toml`, `pahebatcher/build.gradle.kts:10-17,49`).
+- **Toolchain (verified against build files):** JDK 25, Gradle 9.8.2 (wrapper), AGP 9.4.1, Kotlin 2.4.20,
+  KSP 2.3.12, compileSdk/targetSdk 37, minSdk 32 (`gradle/libs.versions.toml`, `gradle/wrapper/gradle-wrapper.properties:4`, `pahebatcher/build.gradle.kts:61,65-68,152-154`).
 - **JVM gate:** `.\gradlew.bat testDebugUnitTest` (`--rerun-tasks` for counts of record). Latest
-  counts of record: **114 suites / 1,236 tests / 0 failures / 0 errors / 0 skipped**
-  (`ROADMAP.md:2194`, 2026-10-21).
-- **Lint gate:** `.\gradlew.bat lintDebug` — 0 errors target; latest 0 errors / 39 warnings / 1 hint
-  (`ROADMAP.md:2195`).
+  counts of record: **115 suites / 1,248 tests / 0 failures / 0 errors / 0 skipped**
+  (`PRE_PUSH_CHECKLIST.md` gate B and `DECISIONS.md:8153`, 2026-10-24).
+- **Lint gate:** `.\gradlew.bat lintDebug` — 0 errors target; latest 0 errors / 41 warnings + 1 note
+  (`PRE_PUSH_CHECKLIST.md`: P-06, 2026-10-24).
 - **APKs (per CPU ABI since the 2026-10-24 ABI-split round):** `.\gradlew.bat assembleDebug`
   → `pahebatcher/build/outputs/apk/debug/pahebatcher-arm64-v8a-debug.apk` and `pahebatcher-x86_64-debug.apk`
   (install the split matching the device; historical single-file records above/below
   predate the split).
-- **Citation gate:** `powershell -ExecutionPolicy Bypass -File scripts\check-doc-citations.ps1`
-  must PASS/exit 0; it scans AGENTS/DECISIONS/LIMITATIONS/ROADMAP/PARITY plus `PHASE11_HANDOFF.md`
-  as a cite-only member (`scripts/check-doc-citations.ps1:90-103`; the handoff member now
-  resolves at its archived path `archive/phase-reports/PHASE11_HANDOFF.md`, repointed 2026-10-22).
+- **Citation gate (gitignored, run locally):** `scripts\check-doc-citations.ps1` (which scanned AGENTS/DECISIONS/
+  LIMITATIONS/ROADMAP/PARITY plus `PHASE11_HANDOFF.md` as a cite-only member, repointed to its
+  archived path `archive/phase-reports/PHASE11_HANDOFF.md` 2026-10-22) was removed from the
+  repository on 2026-10-24 when `scripts/` was untracked and restored locally 2026-11-14; `FILE:NNNN` citations must now be
+  validated manually in a fresh clone.
 - **Device runs:** NEVER `connectedDebugAndroidTest` on a data-bearing device (it uninstalls both
   APKs and destroys data — `ANDROID_TESTING_AND_RELEASE.md:189-197`). Use `adb -s <serial> install -r
   --user <id>` and direct `am instrument -w -e class <FQCN>`, one class per invocation; never target
@@ -160,7 +164,7 @@ Where counts of record are needed, cite `ROADMAP.md` (latest round) rather than 
 - **Deployment (AGENTS §20):** install the latest debug APK to every `device`-state serial with
   `adb -s <serial> install -r`; verify installation; never uninstall or reset app data.
 - **Evidence rules:** raw output quotes, APK SHA-256 + `lastUpdateTime`, device serial + user id,
-  sanitized logs (`ANDROID_TESTING_AND_RELEASE.md:328-340`).
+  sanitized logs (`ANDROID_TESTING_AND_RELEASE.md:356-364`).
 
 ## 7. Verified Python parity and intentional Android adaptations
 
@@ -206,7 +210,7 @@ currently open/conditional areas (by section) are:
 
 ## 9. Relevant decisions (pointers)
 
-**Canonical source:** `DECISIONS.md` — 8,058 lines, Decisions **1–163** (2026-09-21 → 2026-10-21).
+**Canonical source:** `DECISIONS.md` — 8,157 lines, Decisions **1–166** (2026-09-21 → 2026-10-24).
 This file intentionally contains **no decision content**. Orientation map only:
 
 | Span | Subject |
@@ -221,6 +225,7 @@ This file intentionally contains **no decision content**. Orientation map only:
 | 122–141 | Phase 17 streaming, SPEC gap closure (gaps 1–5), release logging, export directory |
 | 142–156 | audio source slices A–C, per-audio export identity, paging, replace file, UI reviews |
 | 157–163 | Prompt 3 release gate; Phase A/A2/A2.1 audits; closure rounds (2026-10-18 → 10-21) |
+| 164–166 | run-ownership race fix, AQR-138/140 stabilization, output-validation parity (2026-10-22 → 10-24) |
 
 Supersessions are recorded inline in `DECISIONS.md` (e.g. 94.2 supersedes the Sessions pause note;
 114 supersedes PHASE10 §14; 143/144 supersede parts of 142).
@@ -236,7 +241,8 @@ Supersessions are recorded inline in `DECISIONS.md` (e.g. 94.2 supersedes the Se
 - **Phase 11.5, 12A–12D, 13, 14, 15:** COMPLETE (13: 2026-10-02; 14: 2026-10-03/04; 15: 2026-10-04).
 - **Closure rounds:** Prompt 3 final release gate (COMPLETE, `:1938`), Phase A (`:1969`), Phase A2
   (`:1996`), Phase A2.1 + closure round (CLOSED 2026-10-21, `:2058`), PB-004 + UI-008 round
-  (COMPLETE/VERIFIED, `:2118`), **Closure-gap remediation round — Prompt 1 (CLOSED, `:2148-2206`,
+  (COMPLETE/VERIFIED, `:2118`), Closure-gap remediation round — Prompt 1 (CLOSED, `:2148-2210`),
+  **Pause/Resume run-ownership race fix (2026-10-22/23, exit criteria met, `:2214-2230`,
   the last ROADMAP entry)**.
 - **Next approved work:** no new implementation phase is approved after Prompt 1. Open items are
   record-only follow-ups TEST-012/TEST-014, the 7 deferred user-decision findings (§4), the open
@@ -246,7 +252,8 @@ Supersessions are recorded inline in `DECISIONS.md` (e.g. 94.2 supersedes the Se
   `DECISIONS.md:7727` has been clarified in place with dated bracketed markers (round-scope
   statement only — Phase 14 and Phase 15 were already COMPLETE per `ROADMAP.md:794`/:839); the
   same 2026-10-22 reconciliation round also superseded in place the stale Room schema-version
-  claim (`PARITY.md`, now cites v4 at `PaheDatabase.kt:52`), the stale "no runtime prompt"
+  claim (`PARITY.md`, re-pointed in that round to v4 at `PaheDatabase.kt:52`; the schema is now
+  v5 — see §2), the stale "no runtime prompt"
   claims (`LIMITATIONS.md` §4/§9 — the prompt ships, `AnimeDetailsViewModel.kt:1607`), the
   stale test counts and citation-checker status (`ANDROID_TESTING_AND_RELEASE.md` §3/§13),
   the stale Phase 16 streaming annotation (`ROADMAP.md:533`), and the dead
@@ -259,7 +266,8 @@ Supersessions are recorded inline in `DECISIONS.md` (e.g. 94.2 supersedes the Se
 ## 11. Provenance: verified current behavior vs historical evidence
 
 - **Verified current behavior** = claims in §1–§7 confirmed against the current source tree on
-  2026-10-22 (file:line citations above) and against the passing JVM suite. Device claims appear
+  2026-10-22 (file:line citations above) and against the passing JVM suite; the stale items found
+  in this file were re-verified and corrected against source on 2026-11-14. Device claims appear
   only where a physical-device evidence record exists in `ANDROID_FEATURE_CATALOG.md` /
   `ANDROID_TESTING_AND_RELEASE.md` (device `REDACTED-SERIAL`); unit tests are never presented as device
   evidence.
@@ -275,15 +283,16 @@ Supersessions are recorded inline in `DECISIONS.md` (e.g. 94.2 supersedes the Se
     `PHASE10_ARCHITECTURE_V8.md` / `V9.md` (self-labeled SUPERSEDED banners), `PHASE3_REPORT.md`,
     `PHASE5_VALIDATION.md`, `PHASE8_AUDIT_REPORT.md` (unreferenced early-phase reports; several
     claims contradicted by current source). The one live `:NNNN` citation into an archived file
-    (`DECISIONS.md:4984` → `PHASE11_ARCHITECTURE_V1.md:340`) still resolves through the checker's
-    recursive leaf index; no protected-document citation was changed.
+    (`DECISIONS.md:4984` → `PHASE11_ARCHITECTURE_V1.md:340`) resolved through the checker's
+    recursive leaf index (checker restored locally 2026-11-14, gitignored); no protected-document citation was changed.
   - **Archived 2026-10-22 (second pass, sequential-maintenance round):** `PHASE11_HANDOFF.md`
     (self-labeled HISTORICAL — SUPERSEDED interruption record) → `archive/phase-reports/`.
-    The citation checker still validates the baseline chain: its `$ExtraCiteFiles` entry was
-    repointed to the archived path (`scripts/check-doc-citations.ps1:102`), so
+    The citation checker (removed with `scripts/` on 2026-10-24, restored locally 2026-11-14) had validated the baseline
+    chain: its `$ExtraCiteFiles` entry was repointed to the archived path
+    (`scripts/check-doc-citations.ps1:102`, as of its removal), so
     `PHASE11_HANDOFF:63` citations from `ROADMAP.md:584` / `DECISIONS.md:2292` / `:3090`
-    resolve unchanged, and the 114,869,141-byte figure pin continues to scan the five root
-    primary documents (`scripts/check-doc-citations.ps1:564-590`).
+    point at the archived copy, and the 114,869,141-byte figure pin was scanned across the five
+    root primary documents (`scripts/check-doc-citations.ps1:564-590`).
   - **Retained in root:** `PHASE14_PLAN.md` + `PHASE14_IMPLEMENTATION_STATE.md` (Phase 14
     COMPLETE; still citation-maintained — live `:NNNN` citations from this file and
     `ANDROID_TESTING_AND_RELEASE.md` — and the latter supplies the operational knowledge

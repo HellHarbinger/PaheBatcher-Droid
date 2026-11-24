@@ -8154,4 +8154,4 @@ and superseded in place with bracketed markers rather than rewritten.
 
 **Scope exclusions.** Documentation-only entry: no production source, test source, Gradle, dependency, signing, or release change in this cycle; no Git operations.
 
-[Back to Index](Index.md)
+[Back to Index](README.md)
