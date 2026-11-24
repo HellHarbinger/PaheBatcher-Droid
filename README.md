@@ -46,7 +46,7 @@
 | **Follow series**               | A watchlist with background checks and a "new episodes" notification                     |
 | **Configure**                   | Quality, parallel download limits, Wi-Fi-only mode, storage folder, notification toggles |
 
-**Status:** v0.2.0 — an early-stage release distributed as signed builds on the
+**Status:** v0.2.1 — an early-stage release distributed as signed builds on the
 [Releases page](https://github.com/HellHarbinger/PaheBatcher-Droid/releases). **Not on Google
 Play.** Requires Android 12L (API 32)+ and a 64-bit device.
 
