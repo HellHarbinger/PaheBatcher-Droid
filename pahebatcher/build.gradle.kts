@@ -56,6 +56,62 @@ if (pbSigningPresent != 0 && pbSigningPresent != pbSigningEnvNames.size) {
 }
 val pbSigningReady = pbSigningPresent == pbSigningEnvNames.size
 
+// ---------------------------------------------------------------------------
+// Release version propagation: -PappVersionName / -PappVersionCode
+// ---------------------------------------------------------------------------
+// The release workflow resolves the release version and passes it to Gradle as
+// -PappVersionName=... / -PappVersionCode=.... Those properties MUST be read
+// here: a previous revision hardcoded the values in defaultConfig, so the
+// CI-supplied versions were silently ignored (Gradle does not fail on unused
+// -P properties) and stale defaults were embedded in the APK and AAB.
+// Contract:
+//   * property supplied -> validated below (non-blank versionName, positive
+//     integer versionCode) and used; an invalid value fails the build during
+//     configuration, before any artifact is produced;
+//   * property absent   -> the local defaults in defaultConfig apply, so local
+//     development builds behave exactly as before;
+//   * CI release-artifact build (assembleRelease/bundleRelease requested with
+//     CI=true) -> BOTH properties are REQUIRED: a missing value fails the
+//     build during configuration instead of falling back to stale defaults.
+val pbVersionNameProp = providers.gradleProperty("appVersionName").orNull
+val pbVersionCodeProp = providers.gradleProperty("appVersionCode").orNull
+
+if (pbVersionNameProp != null && pbVersionNameProp.isBlank()) {
+    throw GradleException(
+        "-PappVersionName was supplied but is blank; refusing to configure an " +
+            "invalid versionName."
+    )
+}
+val pbVersionCodeNum: Int? = pbVersionCodeProp?.let { raw ->
+    val parsed = raw.toIntOrNull()
+    if (parsed == null || parsed <= 0) {
+        throw GradleException(
+            "-PappVersionCode '${raw}' is not a positive integer; refusing to " +
+                "configure an invalid versionCode."
+        )
+    }
+    parsed
+}
+
+val pbReleaseArtifactRequested = gradle.startParameter.taskNames.any { task ->
+    val leaf = task.substringAfterLast(':')
+    leaf == "assembleRelease" || leaf == "bundleRelease"
+}
+if (providers.environmentVariable("CI").orNull == "true" && pbReleaseArtifactRequested) {
+    if (pbVersionNameProp == null) {
+        throw GradleException(
+            "CI release build requires -PappVersionName; refusing to fall back " +
+                "to the local default versionName."
+        )
+    }
+    if (pbVersionCodeProp == null) {
+        throw GradleException(
+            "CI release build requires -PappVersionCode; refusing to fall back " +
+                "to the local default versionCode."
+        )
+    }
+}
+
 android {
     namespace = "com.pahebatcher.app"
     compileSdk = 37
@@ -64,8 +120,8 @@ android {
         applicationId = "com.pahebatcher.app"
         minSdk = 32
         targetSdk = 37
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = pbVersionCodeNum ?: 2
+        versionName = pbVersionNameProp ?: "0.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
