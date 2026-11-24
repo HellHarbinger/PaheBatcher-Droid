@@ -120,8 +120,8 @@ android {
         applicationId = "com.pahebatcher.app"
         minSdk = 32
         targetSdk = 37
-        versionCode = providers.gradleProperty("appVersionCode").orNull?.toInt() ?: 3
-        versionName = providers.gradleProperty("appVersionName").orNull ?: "0.2.1"
+        versionCode = providers.gradleProperty("appVersionCode").orNull?.toInt() ?: 4
+        versionName = providers.gradleProperty("appVersionName").orNull ?: "0.2.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
