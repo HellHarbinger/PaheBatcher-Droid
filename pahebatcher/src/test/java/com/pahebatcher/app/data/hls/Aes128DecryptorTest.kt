@@ -133,7 +133,7 @@ class Aes128DecryptorTest {
     }
 
     @Test
-    fun `decrypt with different key fails`() {
+    fun `decrypting with a different key produces different bytes`() {
         val correctKey = randomKey()
         // Guaranteed-different partner key, derived rather than a literal constant.
         val wrongKey = correctKey.map { (it.toInt() xor 0xFF).toByte() }.toByteArray()
@@ -145,9 +145,13 @@ class Aes128DecryptorTest {
         // the ciphertext matches PKCS5Padding byte-for-byte (see HlsTestCipher).
         val ciphertext = encryptRaw(HlsTestCipher.pkcs7Pad(plaintext), correctKey, iv)
 
-        // Decrypt with wrong key — should fail (bad padding or wrong data)
+        // The production decryptor uses AES/CBC/NoPadding, so a wrong key does
+        // NOT fail: decryption completes and produces incorrect plaintext bytes
+        // (there is no padding check that could reject them).
         val decrypted = Aes128Decryptor.decrypt(ciphertext, wrongKey, iv)
-        // Either null (decryption error) or different bytes
+        // The meaningful assertion: whatever comes back must differ from the
+        // original plaintext (null would mean decryption reported a structural
+        // error rather than wrong bytes).
         if (decrypted != null) {
             assertFalse("Decrypted with wrong key should not match original",
                 plaintext.contentEquals(decrypted))

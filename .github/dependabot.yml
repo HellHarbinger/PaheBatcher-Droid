@@ -1,12 +1,27 @@
 # Dependabot configuration for PaheBatcher-Droid.
 #
-# Rationale (see DECISIONS.md, "Dependabot configuration" section):
+# Rationale (see DECISIONS.md 167 and LIMITATIONS.md 54.7):
 #   * Weekly cadence with grouped PRs keeps review load low while still
 #     clearing advisories promptly (security groups are NOT subject to the
 #     default 3-day version-update cooldown).
-#   * The `gradle` ecosystem covers settings.gradle.kts, gradle/libs.versions.toml,
-#     pahebatcher/build.gradle.kts and the generated lockfiles
-#     (pahebatcher/gradle.lockfile, pahebatcher/buildscript-gradle.lockfile).
+#   * The `gradle` ecosystem reads the manifests this repository actually
+#     declares versions in: settings.gradle.kts, gradle/libs.versions.toml
+#     and pahebatcher/build.gradle.kts. Version updates for DIRECTLY declared
+#     dependencies (catalog entries, plugins) are expected from these files;
+#     the generated lockfiles (pahebatcher/gradle.lockfile,
+#     pahebatcher/buildscript-gradle.lockfile) are parsed by the updater
+#     (dependabot-core#16669) but do NOT by themselves enable updates.
+#   * Security updates for the pinned TRANSITIVE dependencies (guava, bcprov/
+#     bcpkix, jdom2, jose4j, commons-lang3, httpclient) are NOT claimed to be
+#     automated: GitHub documents that security updates are triggered only
+#     for dependencies specified in a manifest or lock file, and that for
+#     ecosystems other than npm/NuGet Dependabot cannot update a transitive
+#     dependency when doing so would also require updating the parent
+#     dependency. Those seven exist only as AGP/lint/KSP/Media3 transitives,
+#     and no successful GitHub-hosted security-update run has been observed
+#     for them (LIMITATIONS.md 54.7). Their remediation is the Gradle
+#     minimum-version pins in gradle/libs.versions.toml plus the manual
+#     process documented there.
 #   * The `github-actions` ecosystem keeps the SHA-pinned workflow actions in
 #     .github/workflows/ current (each pin carries a trailing version comment
 #     that Dependabot maintains).
@@ -41,9 +56,10 @@ updates:
       prefix: "deps"
       include: "scope"
     groups:
-      # One PR for every open advisory so multi-CVE updates (e.g. the
-      # bcprov/bcpkix/jose4j/jdom2/guava/commons-lang3/httpclient batch from
-      # run 45431153460) land together instead of as eight failing jobs.
+      # IF GitHub opens security-update PRs for advisories, group them so a
+      # multi-CVE batch lands as ONE PR instead of several separate jobs.
+      # Whether security-update PRs are opened at all for the pinned Gradle
+      # transitives is NOT established - see LIMITATIONS.md 54.7.
       gradle-security-updates:
         applies-to: security-updates
         patterns:

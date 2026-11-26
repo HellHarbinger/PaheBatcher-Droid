@@ -9,9 +9,19 @@
 // gradle/libs.versions.toml. Pins are MINIMUM versions: they only ever
 // upgrade a requested version, never downgrade one, so a future toolchain
 // that ships a newer (already-patched) release is left alone.
-// The helpers below are declared first because the buildscript block is
-// compiled in a separate pass that can only see declarations above it.
-// Rationale and advisory mapping: DECISIONS.md.
+// These pins are enforced by Gradle itself in every local and CI build; they
+// are NOT managed by Dependabot. Dependabot version updates cover only
+// dependencies declared in the supported manifests, and security updates for
+// these transitive-only artifacts are not established (LIMITATIONS.md 54.7).
+// The version comparison and Guava flavor decision live in buildSrc
+// (PbDependencyVersions.kt) so they are unit-tested: the project-level
+// helpers below import them, while the buildscript block - which compiles in
+// a separate pass that does not apply file-level imports - references them
+// fully-qualified. Rationale and advisory mapping: DECISIONS.md.
+
+import com.pahebatcher.buildlogic.pbGuavaFlavor
+import com.pahebatcher.buildlogic.pbGuavaTargetVersion
+import com.pahebatcher.buildlogic.pbVersionAtLeast
 
 /** Central pin versions read from the gradle/libs.versions.toml catalog. */
 fun pbSecurityPins(): Map<String, String> = mapOf(
@@ -22,25 +32,6 @@ fun pbSecurityPins(): Map<String, String> = mapOf(
     "commonsLang3" to libs.versions.commonsLang3.get(),
     "httpclient" to libs.versions.httpclient.get(),
 )
-
-/** Numeric leading components of a version ("33.7.2-android" -> [33, 7, 2]). */
-fun pbVersionParts(version: String): List<Int> =
-    version.takeWhile { it.isDigit() || it == '.' }
-        .trim('.')
-        .split('.')
-        .map { it.toIntOrNull() ?: 0 }
-
-/** True when [actual] >= [required] comparing only the numeric prefix. */
-fun pbVersionAtLeast(actual: String, required: String): Boolean {
-    val a = pbVersionParts(actual)
-    val r = pbVersionParts(required)
-    for (i in 0 until maxOf(a.size, r.size)) {
-        val av = a.getOrElse(i) { 0 }
-        val rv = r.getOrElse(i) { 0 }
-        if (av != rv) return av > rv
-    }
-    return true
-}
 
 /**
  * Applies the security pins to a single dependency request.
@@ -91,17 +82,13 @@ fun DependencyResolveDetails.pbApplySecurityPins(
 
         group == "com.google.guava" && artifact == "guava" -> {
             val pin = pins.getValue("guava")
-            val flavor = if (
-                configurationName == "classpath" ||
-                configurationName == "androidLintTool" ||
-                configurationName.contains("ksp", ignoreCase = true)
-            ) {
-                "jre"
-            } else {
-                "android"
-            }
-            val target = "$pin-$flavor"
-            if (!version.endsWith("-$flavor") || !pbVersionAtLeast(version, pin)) {
+            val flavor = pbGuavaFlavor(configurationName)
+            // Decision logic lives in buildSrc and is unit-tested: a newer
+            // requested base is ALWAYS preserved (flavor applied to it), a
+            // sub-pin request is raised to the pin, and an already-correct
+            // request is not rewritten - flavor selection never downgrades.
+            val target = pbGuavaTargetVersion(version, pin, flavor)
+            if (target != version) {
                 useVersion(target)
                 because("Security pin: guava $target (CVE-2026-102554)")
             }
@@ -127,8 +114,10 @@ fun DependencyResolveDetails.pbApplySecurityPins(
 
 // Buildscript classpath pins (plugin/AGP toolchain transitives). NOTE: this
 // block compiles in a separate pass that cannot see script-level declarations,
-// so the pin logic is duplicated locally; the shared helpers above serve every
-// project configuration instead.
+// so the pin MAP is duplicated locally; the version comparison and Guava
+// flavor decision come from buildSrc, which is on the classpath of every
+// build script, so both passes share ONE tested implementation. The shared
+// helpers above serve every project configuration instead.
 buildscript {
     // Lock the plugin/AGP classpath too (separate gradle.lockfile for the
     // buildscript: buildscript-gradle.lockfile).
@@ -143,16 +132,6 @@ buildscript {
         "commonsLang3" to libs.versions.commonsLang3.get(),
         "httpclient" to libs.versions.httpclient.get(),
     )
-    fun pbAtLeast(actual: String, required: String): Boolean {
-        val a = actual.takeWhile { it.isDigit() || it == '.' }.trim('.').split('.').map { it.toIntOrNull() ?: 0 }
-        val r = required.takeWhile { it.isDigit() || it == '.' }.trim('.').split('.').map { it.toIntOrNull() ?: 0 }
-        for (i in 0 until maxOf(a.size, r.size)) {
-            val av = a.getOrElse(i) { 0 }
-            val rv = r.getOrElse(i) { 0 }
-            if (av != rv) return av > rv
-        }
-        return true
-    }
     configurations.all {
         resolutionStrategy.eachDependency {
             val g = requested.group ?: return@eachDependency
@@ -161,28 +140,32 @@ buildscript {
             when {
                 g == "org.bouncycastle" && n.endsWith("-jdk18on") -> {
                     val pin = pbPins.getValue("bouncycastle")
-                    if (!pbAtLeast(v, pin)) useVersion(pin)
+                    if (!com.pahebatcher.buildlogic.pbVersionAtLeast(v, pin)) useVersion(pin)
                 }
                 g == "org.jdom" && n == "jdom2" -> {
                     val pin = pbPins.getValue("jdom2")
-                    if (!pbAtLeast(v, pin)) useVersion(pin)
+                    if (!com.pahebatcher.buildlogic.pbVersionAtLeast(v, pin)) useVersion(pin)
                 }
                 g == "org.bitbucket.b_c" && n == "jose4j" -> {
                     val pin = pbPins.getValue("jose4j")
-                    if (!pbAtLeast(v, pin)) useVersion(pin)
+                    if (!com.pahebatcher.buildlogic.pbVersionAtLeast(v, pin)) useVersion(pin)
                 }
                 g == "com.google.guava" && n == "guava" -> {
-                    // The buildscript classpath always runs on the JVM: -jre flavor.
+                    // The buildscript classpath always runs on the JVM: -jre
+                    // flavor. pbGuavaTargetVersion preserves any newer
+                    // requested base instead of forcing the pin (the old
+                    // inline check downgraded e.g. 34.0.0-jre to 33.7.2-jre).
                     val pin = pbPins.getValue("guava")
-                    if (!pbAtLeast(v, pin) || !v.endsWith("-jre")) useVersion("$pin-jre")
+                    val target = com.pahebatcher.buildlogic.pbGuavaTargetVersion(v, pin, "jre")
+                    if (target != v) useVersion(target)
                 }
                 g == "org.apache.commons" && n == "commons-lang3" -> {
                     val pin = pbPins.getValue("commonsLang3")
-                    if (!pbAtLeast(v, pin)) useVersion(pin)
+                    if (!com.pahebatcher.buildlogic.pbVersionAtLeast(v, pin)) useVersion(pin)
                 }
                 g == "org.apache.httpcomponents" && n == "httpclient" -> {
                     val pin = pbPins.getValue("httpclient")
-                    if (!pbAtLeast(v, pin)) useVersion(pin)
+                    if (!com.pahebatcher.buildlogic.pbVersionAtLeast(v, pin)) useVersion(pin)
                 }
             }
         }
