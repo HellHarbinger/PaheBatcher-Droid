@@ -2229,4 +2229,23 @@ This section closes ONLY the run-ownership race-fix task (DECISIONS 164). It clo
 
 Scope boundary (documented, not hidden): the progress flusher (`updateProgress`, `EpisodeDownloadDao.kt:140`) and `updateTotalSegments` (`EpisodeDownloadDao.kt:612`) remain outside the ownership guard by design - a stale run may still land progress/total fields, never state or ownership (DECISIONS 164 bullet 6, LIMITATIONS 4). Phase 14 and Phase 15 were NOT started by this task.
 
+## Build Simplification, Dependency Management & Security Remediation (2026-11-25) - COMPLETE
+
+**Status**: COMPLETED (all 10 phases of the build/security task executed; DECISIONS 167, LIMITATIONS 54)
+
+**Deliverables**:
+- [x] **Phase 0 - baseline**: HEAD `629bcea`; `assembleDebug`/`testDebugUnitTest`/`lintDebug` green; Snyk OS 41 issues (4C/21H/16M unique), Snyk Code 19 findings (0H/2M/17L); artifacts archived outside the repo.
+- [x] **Phase 1 - root `build.gradle.kts` removed** (6-line `apply false` alias file; plugin aliases resolve from `:pahebatcher` via catalog accessors); `settings.gradle.kts` repositories centralized, `FAIL_ON_PROJECT_REPOS` preserved; single-module structure kept.
+- [x] **Phase 2 - version catalog single source of truth**: `gradle/libs.versions.toml` rewritten - every version via `version.ref`, duplicate version keys deduplicated, hardcoded `material-icons-core` migrated, no dynamic versions, BOM-managed libs unversioned, logical grouping; no buildSrc/convention plugins/composite builds introduced.
+- [x] **Phase 3 - locking + verification**: `dependencyLocking { lockAllConfigurations() }` + buildscript classpath locking; three committed lockfiles (`pahebatcher/gradle.lockfile`, `pahebatcher/buildscript-gradle.lockfile`, `settings-gradle.lockfile`); `gradle/verification-metadata.xml` (SHA-256, 448 components/774 checksums); negative test proven (corrupt AGP checksum -> build fails -> restore -> green); combined regeneration command documented.
+- [x] **Phase 4 - eight reported vulnerabilities remediated**: minimum-version pins (never downgrade) in catalog + `resolutionStrategy.eachDependency`, applied in `buildscript{}` and `configurations.all`; bcprov/bcpkix/bcutil 1.86, jdom2 2.0.6.1, jose4j 0.9.6, guava 33.7.2 (flavor-preserving `-jre`/`-android` split), commons-lang3 3.18.0, httpclient 4.5.14; AGP 9.4.1 retained after empirically proving 9.5.2 fixes none of the eight; `snyk test` confirms ZERO occurrences of any of the eight at any version.
+- [x] **Phase 5 - Dependabot failure diagnosed**: run 45431153460 (and 45430901269, 40757089343) failed because NONE of the seven named dependencies existed in any manifest at the failing SHAs (`50691bc`, `3d6dcb06`) - they were snapshot-only AGP/lint/KSP transitives with nothing editable to patch (dependabot-core "no files changed" class); failure pre-dates this round; updater log requires write access (documented honestly).
+- [x] **Phase 6 - Snyk Code remediation**: 19 findings -> 3 remaining (16 genuinely fixed, 0 suppressed): SecureRandom test keys x6, PKCS5Padding -> manual PKCS7 + single shared `HlsTestCipher` test helper x3, parameterized MediaStore teardown deletes x2, debug SSL bypass `proceed()` -> `cancel()` x1; the 3 inherent findings (RFC 8216 §5.2 production CBC, shared test CBC helper, WebView JS test) documented in source + LIMITATIONS 54.2.
+- [x] **Phase 7 - `.github/dependabot.yml` created**: weekly (Mon 06:00 Asia/Kolkata), grouped security updates (`applies-to: security-updates`) + minor/patch group, majors separate, `github-actions` ecosystem included, Dependabot retained (no Renovate); YAML validated; `applies-to` syntax checked against official GitHub docs; regeneration command for dependabot-core#1996 recorded in header.
+- [x] **Phase 8 - validation**: full battery (`assembleDebug`, `assembleRelease`, `bundleRelease`, `testDebugUnitTest`, `testReleaseUnitTest`, `lintDebug`, `assembleDebugAndroidTest`) BUILD SUCCESSFUL with pins + locking + verification active; unit tests for changed files 17/17 + 34/34; instrumented MediaStore suites 23/23 + 5/5 on device 433aaa40; release workflow reviewed and unmodified (only cosmetic root-file references); Compose/KSP/Room/Media3/FFmpegKit/ABI packaging intact via successful release builds.
+- [x] **Phase 9 - cleanup**: no temp reports in repo, no debug code left, diff reviewed (9 modified + 1 deleted + 6 added files, all in scope).
+- [x] **Phase 10 - final report** delivered to owner (no commits made).
+
+**Final scan deltas**: Snyk Code 19 -> 3 (3 inherent, documented); Snyk OS 41 -> 5 (all 5 pre-existing `org.ow2.asm` toolchain advisories with byte-identical baseline IDs; zero new findings).
+
 [Back to Index](README.md)

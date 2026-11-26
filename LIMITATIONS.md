@@ -3540,3 +3540,159 @@ playback mode.**
     waited, and the dialog appeared when the user returned to Downloads - tab position
     preserved, prompt timing disconnected from the tap. **Adopted alternative B
     supersedes the defer behavior; the test above was updated accordingly.**
+
+## 54. Build simplification / dependency security round (DECISIONS 167, 2026-11-25) - platform gaps and accepted residuals
+
+### 54.1 Dependabot cannot update `gradle/verification-metadata.xml` checksums (dependabot-core#1996, open upstream)
+
+- **Limitation:** Gradle dependency verification rejects any artifact whose SHA-256
+  is absent from `gradle/verification-metadata.xml`. dependabot-core does not write
+  or amend that file when it opens a Gradle version-update PR, so a merged
+  Dependabot PR that changes any resolved artifact will fail the next build with a
+  verification error until the checksums are regenerated.
+- **Affected features:** every future Dependabot Gradle PR (version updates AND
+  security updates); CI verification gates in `release-artifact-v2.yml`.
+- **Workaround (documented, not automated):** after merging any Dependabot Gradle
+  PR, regenerate locks + checksums locally and commit them together with the PR's
+  changes:
+  `./gradlew --write-verification-metadata sha256 --write-locks :pahebatcher:dependencies :pahebatcher:buildEnvironment :pahebatcher:assembleDebug :pahebatcher:assembleRelease :pahebatcher:bundleRelease :pahebatcher:testDebugUnitTest :pahebatcher:testReleaseUnitTest :pahebatcher:lintDebug :pahebatcher:assembleDebugAndroidTest`
+  (the command is also recorded in `.github/dependabot.yml` header comments).
+- **Why not disabled:** disabling verification to accommodate the bot would weaken
+  supply-chain integrity for every build, which the task rules forbid. The gap is
+  an upstream defect; tracking issue: dependabot-core#1996.
+- **Related upstream fix:** dependabot-core#16669 (merged 2026-11-10) teaches the
+  Gradle updater to parse `gradle.lockfile`, so committed lockfiles now give the
+  security updater editable declarations for previously transitive-only artifacts.
+- **Risk Level:** Low-Medium (build breakage, not a security hole; one documented
+  command resolves it).
+
+### 54.2 Three inherent Snyk Code findings remain (19 -> 3; 0 suppressed)
+
+- **Finding 1 (MEDIUM): `Aes128Decryptor.kt` AES-128-CBC without integrity.**
+  RFC 8216 §5.2 mandates AES-128-CBC for `EXT-X-KEY:METHOD=AES-128`; HLS defines no
+  AEAD mode for this method, so switching to GCM would break playback of every
+  encrypted stream the app exists to download. The call site uses `NoPadding`
+  (no `BadPaddingException` oracle), input is validated before init, ciphertext
+  arrives over HTTPS, and failures are never reflected to a network peer. The KDoc
+  now carries this rationale inline. Protocol-mandated false positive - NOT
+  suppressed, documented in the source and here.
+- **Finding 2 (MEDIUM/LOW): shared test helper `HlsTestCipher.kt` CBC encryption.**
+  The test suite must produce CBC ciphertext to exercise the CBC decryptor (there is
+  no other valid input). The remediation consolidated the previously scattered
+  per-test CBC instances into exactly ONE documented use site instead of eight.
+  Test-only, no production exposure.
+- **Finding 3 (LOW): `WebViewJsonExtractionTest.kt` JavaScript enabled.**
+  The test drives the production `evaluateJavascript` capture scripts; disabling JS
+  would make the test vacuous. Test-only WebView loading first-party fixtures.
+- **Affected Features:** none at runtime; all three are analyzer categories that
+  cannot be cleared without breaking protocol conformance or test fidelity.
+- **Risk Level:** Low (finding 1 is protocol-mandated with mitigating call-site
+  properties; 2 and 3 are test-source only).
+
+### 54.3 Dependabot diagnosis was validated locally, not by a GitHub-hosted rerun
+
+- **Limitation:** the detailed updater log for failed run 45431153460
+  (`/network/updates/1728130935`) requires repository write access (403/404
+  unauthenticated; no `gh` CLI/token available in this environment), and the task
+  rules forbid pushing or changing GitHub settings to trigger a fresh security
+  update. The root-cause conclusion therefore rests on repository-side hard
+  evidence (manifest scans at the failing SHAs, API job metadata, dependabot-core
+  issue classes), not on the updater's own log.
+- **Affected Features:** confidence bound on the Phase 5 diagnosis; the claim that
+  a subsequent GitHub-hosted security update will now succeed is NOT verified.
+- **What WAS validated locally:** the version catalog + lockfiles parse into a
+  complete, pin-enforced dependency graph (`dependencies`/`buildEnvironment`
+  reports show all eight remediated versions), which is exactly the information
+  the updater previously could not find.
+- **Manual action for the owner (GitHub side, not performable here):** after
+  pushing these changes, either wait for the next scheduled/adaptive security run
+  or trigger one from the repository's Security tab, and confirm it opens a PR.
+- **Risk Level:** Low (process/verification gap, not code risk).
+
+### 54.4 Residual Snyk OS findings: 5 x `org.ow2.asm` (pre-existing, toolchain-only)
+
+- **Limitation:** after remediation `snyk test --all-projects` reports 5 MEDIUM
+  issues, all `org.ow2.asm:asm` 9.9/9.9.1 (`Inefficient Algorithmic Complexity`,
+  `Memory Allocation with Excessive Size Value`, `Uncontrolled Recursion`) reached
+  only through AGP/lint/KSP tooling classpaths (`androidLintTool`, `lint-api`,
+  `asm-commons`, `lint-typedef-remover`).
+- **Evidence they are pre-existing:** the advisory IDs
+  (`SNYK-JAVA-ORGOW2ASM-21715439/442/445/448/452`) appear identically in the
+  pre-change baseline scan; zero new findings were introduced by this round.
+- **Why not pinned away:** asm is not among the eight reported vulnerabilities;
+  pinning a bytecode-manipulation library under AGP/lint/KSP (all of which embed
+  and version-match their own ASM) risks toolchain breakage for a lint-time-only
+  medium - an arbitrary upgrade outside the task's mandate. Revisit when AGP
+  itself ships a fixed ASM.
+- **Risk Level:** Low (compile/lint toolchain only; not shipped in the APK).
+
+### 54.5 Instrumented full-suite run depends on device unlock state
+
+- **Limitation:** Activity-launching Compose tests fail wholesale with
+  "No compose hierarchies found" when the physical device is on its secure
+  lockscreen/notification shade (adb cannot bypass the Nothing OS secure lock).
+  This is an environmental precondition, not a code defect: 214 of 236 failures in
+  one run were exactly this class.
+- **Workaround:** device unlocked + `stay_on_while_plugged_in=3` before
+  `connectedDebugAndroidTest`; results are only meaningful with
+  `mCurrentFocus` on the launcher/app and `showing=false`.
+- **Risk Level:** Low (test-environment only; recorded so future runs are
+  interpreted correctly).
+
+### 54.6 Full instrumented suite after this round: 663 tests / 6 failures, none in scope
+
+- **Result:** `connectedDebugAndroidTest` on device `433aaa40` (AIN065, Android 16),
+  run with the device unlocked: **663 tests, 6 failures, 0 errors**. Classification:
+  - **2 x live-network** (`Phase17DeviceStreamingVerificationTest`,
+    `Phase17StreamingSiblingNavigationDeviceTest`) - both fail at STEP 1 with
+    "search must return at least one title (got 0)", i.e. the external backend/Cloudflare
+    refused the search. This is the long-documented external-dependency class, not code.
+  - **3 x `FirstEnqueuePromptTest.a_denied_*`** - `AssumptionViolatedException`, the
+    test's own honest `Assume.assumeFalse("baseline is GRANTED ...")` skip. Documented
+    TEST/ENVIRONMENTAL precondition (LIMITATIONS 42.2): the denied-flow cases require a
+    fresh install with `POST_NOTIFICATIONS` not yet granted, which a non-fresh install
+    does not provide.
+  - **1 x `AnimeDetailsScreenTest.thePagerStaysAccessibleAtDoubleFontScale`** -
+    `assertIsDisplayed` fails on `anime_details_page_number_12` (the LAST page button)
+    at `fontScale = 2f`, while the preceding `page_number_2` assertion passes. **Not
+    attributable to this round**, on static evidence:
+    1. `AnimeDetailsScreen.kt`, `AnimeDetailsScreenTest.kt` and `EpisodePaging.kt` are
+       byte-identical to HEAD (`git diff HEAD` empty); this round touches no `ui/` file.
+    2. The runtime classpath differs from baseline ONLY by guava
+       (`33.3.1-android -> 33.7.2-android`) and its transitives - Compose BOM
+       `2026.08.00`, Material3 `1.4.0` and every other UI library are unchanged.
+    3. The failure is a borderline layout-width computation:
+       `pageNumberButtonBudget` -> `pageNumberWindow` -> a `.horizontalScroll` strip
+       where the rightmost button scrolls out of the slot, so it depends purely on the
+       device's dp width, `ButtonDefaults.MinWidth` and Material3 typography.
+    4. This exact branch is already documented as device-width sensitive: on the
+       "~461dp window, ~271dp numbers slot" device it never fits more than ~4 buttons
+       (LIMITATIONS:3294-3296, DECISIONS:7298/7304). The current device computes a
+       **411dp window / ~221dp slot** (1080px / 420dpi), i.e. ~50dp narrower than the
+       documented device, while device display state is stock (`font_scale=1.0`, no
+       `wm size`/`wm density`/`display_size_forced` overrides).
+    - **Baseline execution — COMPLETED, caveat closed.** The confirming run against
+      baseline HEAD `629bcea` in a clean worktree was executed at both widths (it had
+      previously been cancelled by an environment restart; this time it completed,
+      74 tasks, BUILD SUCCESSFUL / failed-as-expected per cell):
+
+      | | @411dp (physical density 420) | @461dp (override density 375) |
+      |---|---|---|
+      | **baseline HEAD `629bcea`** | **FAIL** (`failures="1"`) | **PASS** (`failures="0"`) |
+      | **this round's working tree** | **FAIL** (`failures="1"`) | **PASS** (`failures="0"`) |
+
+      Behaviour is **identical to baseline at both widths**: baseline reproduces the
+      failure at 411dp exactly as this round's tree does, and both pass once the device
+      is set to the documented ~461dp window (density 375 -> 460.8dp, which also restores
+      the documented ~271dp numbers slot). The failure is therefore **pre-existing at HEAD
+      and purely device-width dependent**, not a regression from this round. The static
+      evidence in points 1-4 above and this execution agree.
+    - **Test-environment note:** reproducing the documented window requires
+      `adb shell wm density 375` (the current device's physical density is 420 -> 411dp,
+      ~50dp narrower than the ~461dp device the docs were written against). Device state
+      was restored afterwards (`wm density reset` -> physical 420, `font_scale` 1.0), and
+      the temporary baseline worktree was removed.
+- **Risk Level:** Low (2 external, 3 documented test-environment preconditions, 1
+  device-width-sensitive UI case outside this round's scope).
+
+[Back to Index](README.md)
