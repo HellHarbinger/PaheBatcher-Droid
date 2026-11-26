@@ -1,8 +1,220 @@
+// ---------------------------------------------------------------------------
+// Security pins for vulnerable TRANSITIVE dependencies
+// ---------------------------------------------------------------------------
+// The AGP/lint toolchain introduces several vulnerable transitive libraries
+// (BouncyCastle, jose4j, jdom2, commons-lang3, guava, httpclient) that cannot
+// be reached through the dependency block - they live on the plugin classpath
+// and on tooling-only configurations (androidLintTool, ksp processor paths).
+// They are pinned to patched versions declared centrally in
+// gradle/libs.versions.toml. Pins are MINIMUM versions: they only ever
+// upgrade a requested version, never downgrade one, so a future toolchain
+// that ships a newer (already-patched) release is left alone.
+// The helpers below are declared first because the buildscript block is
+// compiled in a separate pass that can only see declarations above it.
+// Rationale and advisory mapping: DECISIONS.md.
+
+/** Central pin versions read from the gradle/libs.versions.toml catalog. */
+fun pbSecurityPins(): Map<String, String> = mapOf(
+    "bouncycastle" to libs.versions.bouncycastle.get(),
+    "jdom2" to libs.versions.jdom2.get(),
+    "jose4j" to libs.versions.jose4j.get(),
+    "guava" to libs.versions.guava.get(),
+    "commonsLang3" to libs.versions.commonsLang3.get(),
+    "httpclient" to libs.versions.httpclient.get(),
+)
+
+/** Numeric leading components of a version ("33.7.2-android" -> [33, 7, 2]). */
+fun pbVersionParts(version: String): List<Int> =
+    version.takeWhile { it.isDigit() || it == '.' }
+        .trim('.')
+        .split('.')
+        .map { it.toIntOrNull() ?: 0 }
+
+/** True when [actual] >= [required] comparing only the numeric prefix. */
+fun pbVersionAtLeast(actual: String, required: String): Boolean {
+    val a = pbVersionParts(actual)
+    val r = pbVersionParts(required)
+    for (i in 0 until maxOf(a.size, r.size)) {
+        val av = a.getOrElse(i) { 0 }
+        val rv = r.getOrElse(i) { 0 }
+        if (av != rv) return av > rv
+    }
+    return true
+}
+
+/**
+ * Applies the security pins to a single dependency request.
+ *
+ * [configurationName] is required only for guava, whose artifact has two
+ * publishable flavors: the JVM tooling classpaths (buildscript classpath,
+ * androidLintTool, ksp processor classpaths) resolve the -jre flavor, while
+ * every other configuration in this project (compile/runtime/lint-checks/
+ * annotation-processor classpaths) resolves the -android flavor. The flavor is
+ * chosen from the configuration so the two can never collide within one
+ * graph; both flavors carry the same patched base version.
+ */
+fun DependencyResolveDetails.pbApplySecurityPins(
+    configurationName: String,
+    pins: Map<String, String>,
+) {
+    val group = requested.group ?: return
+    val artifact = requested.name ?: return
+    val version = requested.version ?: return
+
+    when {
+        group == "org.bouncycastle" && artifact.endsWith("-jdk18on") -> {
+            val pin = pins.getValue("bouncycastle")
+            if (!pbVersionAtLeast(version, pin)) {
+                useVersion(pin)
+                because(
+                    "Security pin: BouncyCastle jdk18on family aligned to $pin " +
+                        "(CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)"
+                )
+            }
+        }
+
+        group == "org.jdom" && artifact == "jdom2" -> {
+            val pin = pins.getValue("jdom2")
+            if (!pbVersionAtLeast(version, pin)) {
+                useVersion(pin)
+                because("Security pin: jdom2 $pin (CVE-2021-33813, XXE)")
+            }
+        }
+
+        group == "org.bitbucket.b_c" && artifact == "jose4j" -> {
+            val pin = pins.getValue("jose4j")
+            if (!pbVersionAtLeast(version, pin)) {
+                useVersion(pin)
+                because("Security pin: jose4j $pin (CVE-2024-29371, DoS)")
+            }
+        }
+
+        group == "com.google.guava" && artifact == "guava" -> {
+            val pin = pins.getValue("guava")
+            val flavor = if (
+                configurationName == "classpath" ||
+                configurationName == "androidLintTool" ||
+                configurationName.contains("ksp", ignoreCase = true)
+            ) {
+                "jre"
+            } else {
+                "android"
+            }
+            val target = "$pin-$flavor"
+            if (!version.endsWith("-$flavor") || !pbVersionAtLeast(version, pin)) {
+                useVersion(target)
+                because("Security pin: guava $target (CVE-2026-102554)")
+            }
+        }
+
+        group == "org.apache.commons" && artifact == "commons-lang3" -> {
+            val pin = pins.getValue("commonsLang3")
+            if (!pbVersionAtLeast(version, pin)) {
+                useVersion(pin)
+                because("Security pin: commons-lang3 $pin (CVE-2025-48924)")
+            }
+        }
+
+        group == "org.apache.httpcomponents" && artifact == "httpclient" -> {
+            val pin = pins.getValue("httpclient")
+            if (!pbVersionAtLeast(version, pin)) {
+                useVersion(pin)
+                because("Security pin: httpclient $pin (CVE-2020-13956)")
+            }
+        }
+    }
+}
+
+// Buildscript classpath pins (plugin/AGP toolchain transitives). NOTE: this
+// block compiles in a separate pass that cannot see script-level declarations,
+// so the pin logic is duplicated locally; the shared helpers above serve every
+// project configuration instead.
+buildscript {
+    // Lock the plugin/AGP classpath too (separate gradle.lockfile for the
+    // buildscript: buildscript-gradle.lockfile).
+    configurations.classpath {
+        resolutionStrategy.activateDependencyLocking()
+    }
+    val pbPins = mapOf(
+        "bouncycastle" to libs.versions.bouncycastle.get(),
+        "jdom2" to libs.versions.jdom2.get(),
+        "jose4j" to libs.versions.jose4j.get(),
+        "guava" to libs.versions.guava.get(),
+        "commonsLang3" to libs.versions.commonsLang3.get(),
+        "httpclient" to libs.versions.httpclient.get(),
+    )
+    fun pbAtLeast(actual: String, required: String): Boolean {
+        val a = actual.takeWhile { it.isDigit() || it == '.' }.trim('.').split('.').map { it.toIntOrNull() ?: 0 }
+        val r = required.takeWhile { it.isDigit() || it == '.' }.trim('.').split('.').map { it.toIntOrNull() ?: 0 }
+        for (i in 0 until maxOf(a.size, r.size)) {
+            val av = a.getOrElse(i) { 0 }
+            val rv = r.getOrElse(i) { 0 }
+            if (av != rv) return av > rv
+        }
+        return true
+    }
+    configurations.all {
+        resolutionStrategy.eachDependency {
+            val g = requested.group ?: return@eachDependency
+            val n = requested.name ?: return@eachDependency
+            val v = requested.version ?: return@eachDependency
+            when {
+                g == "org.bouncycastle" && n.endsWith("-jdk18on") -> {
+                    val pin = pbPins.getValue("bouncycastle")
+                    if (!pbAtLeast(v, pin)) useVersion(pin)
+                }
+                g == "org.jdom" && n == "jdom2" -> {
+                    val pin = pbPins.getValue("jdom2")
+                    if (!pbAtLeast(v, pin)) useVersion(pin)
+                }
+                g == "org.bitbucket.b_c" && n == "jose4j" -> {
+                    val pin = pbPins.getValue("jose4j")
+                    if (!pbAtLeast(v, pin)) useVersion(pin)
+                }
+                g == "com.google.guava" && n == "guava" -> {
+                    // The buildscript classpath always runs on the JVM: -jre flavor.
+                    val pin = pbPins.getValue("guava")
+                    if (!pbAtLeast(v, pin) || !v.endsWith("-jre")) useVersion("$pin-jre")
+                }
+                g == "org.apache.commons" && n == "commons-lang3" -> {
+                    val pin = pbPins.getValue("commonsLang3")
+                    if (!pbAtLeast(v, pin)) useVersion(pin)
+                }
+                g == "org.apache.httpcomponents" && n == "httpclient" -> {
+                    val pin = pbPins.getValue("httpclient")
+                    if (!pbAtLeast(v, pin)) useVersion(pin)
+                }
+            }
+        }
+    }
+}
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose.compiler)
     alias(libs.plugins.ksp)
     alias(libs.plugins.serialization)
+}
+
+// Project configurations (compile/runtime/ksp/lint/annotation-processor classpaths):
+// same pins as the buildscript classpath above.
+configurations.all {
+    val pbPins = pbSecurityPins()
+    val pbConfigurationName = name
+    resolutionStrategy.eachDependency {
+        pbApplySecurityPins(pbConfigurationName, pbPins)
+    }
+}
+
+// Dependency locking: every project configuration resolves against the checked
+// in pahebatcher/gradle.lockfile (the buildscript classpath locks into
+// pahebatcher/buildscript-gradle.lockfile, activated above). After any
+// intentional version change regenerate locks AND checksums TOGETHER (locks
+// alone fail dependency verification for newly resolved artifacts):
+//   ./gradlew --write-verification-metadata sha256 --write-locks <build tasks>
+// The full task list is documented in .github/dependabot.yml.
+dependencyLocking {
+    lockAllConfigurations()
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +439,7 @@ dependencies {
     // PlayArrow/ArrowBack) — version pinned by the already-verified Compose BOM, NOT
     // material-icons-extended (rejected per §9/§32). material3 1.4.0 no longer exposes
     // the icons package transitively, so the ~dozen core glyphs are declared here.
-    implementation("androidx.compose.material:material-icons-core")
+    implementation(libs.androidx.compose.material.icons.core)
 
     // Room
     implementation(libs.androidx.room.runtime)

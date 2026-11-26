@@ -1,0 +1,75 @@
+# Dependabot configuration for PaheBatcher-Droid.
+#
+# Rationale (see DECISIONS.md, "Dependabot configuration" section):
+#   * Weekly cadence with grouped PRs keeps review load low while still
+#     clearing advisories promptly (security groups are NOT subject to the
+#     default 3-day version-update cooldown).
+#   * The `gradle` ecosystem covers settings.gradle.kts, gradle/libs.versions.toml,
+#     pahebatcher/build.gradle.kts and the generated lockfiles
+#     (pahebatcher/gradle.lockfile, pahebatcher/buildscript-gradle.lockfile).
+#   * The `github-actions` ecosystem keeps the SHA-pinned workflow actions in
+#     .github/workflows/ current (each pin carries a trailing version comment
+#     that Dependabot maintains).
+#   * Majors are deliberately left ungrouped: a single mixed-major PR is too
+#     risky to review for a release-signed Android build. Minors/patches and
+#     security updates are grouped.
+#
+# Known integration gaps (documented in LIMITATIONS.md):
+#   * dependabot-core does not yet update gradle/verification-metadata.xml
+#     checksums (dependabot-core#1996). After merging any Dependabot Gradle PR,
+#     regenerate locks + checksums locally with the documented command:
+#       ./gradlew --write-verification-metadata sha256 --write-locks `
+#         :pahebatcher:dependencies :pahebatcher:buildEnvironment `
+#         :pahebatcher:assembleDebug :pahebatcher:assembleRelease `
+#         :pahebatcher:bundleRelease :pahebatcher:testDebugUnitTest `
+#         :pahebatcher:testReleaseUnitTest :pahebatcher:lintDebug `
+#         :pahebatcher:assembleDebugAndroidTest
+#     and commit the refreshed lockfiles + verification-metadata.xml.
+
+version: 2
+updates:
+  - package-ecosystem: "gradle"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 10
+    rebase-strategy: auto
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      # One PR for every open advisory so multi-CVE updates (e.g. the
+      # bcprov/bcpkix/jose4j/jdom2/guava/commons-lang3/httpclient batch from
+      # run 45431153460) land together instead of as eight failing jobs.
+      gradle-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      # Routine non-major maintenance in a single weekly PR.
+      gradle-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
