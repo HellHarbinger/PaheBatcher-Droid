@@ -2,9 +2,6 @@ package com.pahebatcher.app.data.hls
 
 import org.junit.Assert.*
 import org.junit.Test
-import javax.crypto.Cipher
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
 /**
  * Tests for Aes128Decryptor — AES-128 CBC decryption.
@@ -25,24 +22,22 @@ class Aes128DecryptorTest {
      * Encrypt with RAW CBC (no padding) - the exact inverse of what Python's
      * `AES.new(key, AES.MODE_CBC, iv=iv).decrypt(...)` performs - so these fixtures
      * are reference-compatible ciphertext rather than self-generated Android padding.
+     * Delegates to the suite-wide [HlsTestCipher] helper.
      */
-    private fun encryptRaw(plaintext: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
-        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-        return cipher.doFinal(plaintext)
-    }
+    private fun encryptRaw(plaintext: ByteArray, key: ByteArray, iv: ByteArray): ByteArray =
+        HlsTestCipher.encryptRaw(plaintext, key, iv)
 
     private fun hex(s: String): ByteArray =
         ByteArray(s.length / 2) { i -> s.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
 
+    /** Fresh, non-literal 16-byte AES key (no hardcoded key material in tests). */
+    private fun randomKey(): ByteArray = ByteArray(16).also { java.security.SecureRandom().nextBytes(it) }
+
     @Test
     fun `decrypt round-trips a raw-CBC payload and preserves its length`() {
-        // Key: 0x000102030405060708090A0B0C0D0E0F
-        // IV:  0x00000000000000000000000000000000
-        val key = byteArrayOf(
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-        )
+        // Random key + zero IV: this is a round-trip property test, not a
+        // published known-answer vector (the NIST SP800-38A case below is).
+        val key = randomKey()
         val iv = ByteArray(16) { 0 }
 
         val plaintext = "Hello AES-128!!".toByteArray(Charsets.UTF_8).copyOf(16)
@@ -99,9 +94,10 @@ class Aes128DecryptorTest {
         val iv = ByteArray(16) { 0 }
 
         val unpadded = "Hello AES-128!!".toByteArray(Charsets.UTF_8) // 15 bytes
-        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-        val ciphertext = cipher.doFinal(unpadded) // 16 bytes, one full pad block
+        // Build the PKCS#7-padded block by hand (append 0x01) and encrypt raw, so
+        // the ciphertext is byte-identical to what AES/CBC/PKCS5Padding would emit
+        // without introducing a padded-mode Cipher instance into the test suite.
+        val ciphertext = encryptRaw(HlsTestCipher.pkcs7Pad(unpadded), key, iv) // 16 bytes, one full pad block
 
         val decrypted = Aes128Decryptor.decrypt(ciphertext, key, iv)
 
@@ -138,23 +134,16 @@ class Aes128DecryptorTest {
 
     @Test
     fun `decrypt with different key fails`() {
-        val correctKey = byteArrayOf(
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-        )
-        val wrongKey = byteArrayOf(
-            0xFF.toByte(), 0xFE.toByte(), 0xFD.toByte(), 0xFC.toByte(),
-            0xFB.toByte(), 0xFA.toByte(), 0xF9.toByte(), 0xF8.toByte(),
-            0xF7.toByte(), 0xF6.toByte(), 0xF5.toByte(), 0xF4.toByte(),
-            0xF3.toByte(), 0xF2.toByte(), 0xF1.toByte(), 0xF0.toByte()
-        )
+        val correctKey = randomKey()
+        // Guaranteed-different partner key, derived rather than a literal constant.
+        val wrongKey = correctKey.map { (it.toInt() xor 0xFF).toByte() }.toByteArray()
         val iv = ByteArray(16) { 0 }
 
         // Encrypt with correct key
-        val plaintext = "Test data 16byte".toByteArray(Charsets.UTF_8)
-        val encCipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-        encCipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(correctKey, "AES"), IvParameterSpec(iv))
-        val ciphertext = encCipher.doFinal(plaintext)
+        val plaintext = "Test data 16byte".toByteArray(Charsets.UTF_8) // exactly 16 B
+        // PKCS#7 of a full block appends a whole 0x10 pad block; built by hand so
+        // the ciphertext matches PKCS5Padding byte-for-byte (see HlsTestCipher).
+        val ciphertext = encryptRaw(HlsTestCipher.pkcs7Pad(plaintext), correctKey, iv)
 
         // Decrypt with wrong key — should fail (bad padding or wrong data)
         val decrypted = Aes128Decryptor.decrypt(ciphertext, wrongKey, iv)
@@ -189,10 +178,7 @@ class Aes128DecryptorTest {
 
     @Test
     fun `decrypt with derived IV from media sequence 0`() {
-        val key = byteArrayOf(
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-        )
+        val key = randomKey()
         // Derived IV from seq_num=0: all zeros
         val iv = ByteArray(16) { 0 }
 
@@ -206,10 +192,7 @@ class Aes128DecryptorTest {
 
     @Test
     fun `decrypt with derived IV from media sequence 1`() {
-        val key = byteArrayOf(
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-        )
+        val key = randomKey()
         // Derived IV from seq_num=1: 0x00000000000000000000000000000001
         val iv = ByteArray(16) { 0 }
         iv[15] = 1
@@ -224,10 +207,7 @@ class Aes128DecryptorTest {
 
     @Test
     fun `decrypt with explicit IV differs from derived IV`() {
-        val key = byteArrayOf(
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-        )
+        val key = randomKey()
         val explicitIv = ByteArray(16) { 0x42 }
         val derivedIv = ByteArray(16) { 0 }
 

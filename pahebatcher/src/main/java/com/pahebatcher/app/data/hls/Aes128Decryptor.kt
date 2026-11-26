@@ -48,6 +48,23 @@ import javax.crypto.spec.SecretKeySpec
  * The empty-ciphertext guard below is deliberately NOT relaxed: a zero-byte segment is
  * corrupt, not "unpadded", and AGENTS 12 requires that incomplete segments never be
  * considered completed.
+ *
+ * ## Security note: why CBC (and only CBC) is correct here
+ *
+ * RFC 8216 §5.2 mandates AES-128-CBC for `EXT-X-KEY:METHOD=AES-128`; HLS has no
+ * AEAD mode for METHOD=AES-128 (GCM is not part of the spec for this method), so
+ * switching `Cipher` to `AES/GCM/NoPadding` would make the app unable to play the
+ * very streams it exists to download. CBC is a protocol constraint, not a choice.
+ *
+ * The usual CBC concerns do not apply to this call site:
+ * - **No padding oracle.** Decryption uses `NoPadding`, so there is no
+ *   `BadPaddingException` side channel to probe - errors occur only on input that
+ *   is not a positive multiple of the 16-byte block, before any secret-dependent
+ *   branch is observable.
+ * - **No remote attacker channel.** Decryption is local; ciphertext arrives over
+ *   HTTPS from the CDN, and nothing in the app reflects decryption failures back
+ *   to a network peer.
+ * - Input validation (non-empty, 16-byte key, 16-byte IV) happens before init.
  */
 object Aes128Decryptor {
 

@@ -14,9 +14,6 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
-import javax.crypto.Cipher
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
 /**
  * Tests for EpisodeDownloader — HLS segment download orchestration.
@@ -171,23 +168,21 @@ class EpisodeDownloaderTest {
 
     @Test
     fun `download decrypts AES-128 encrypted segments`() = runTest {
-        val key = byteArrayOf(
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-        )
+        val key = ByteArray(16).also { java.security.SecureRandom().nextBytes(it) }
         val iv = ByteArray(16) { 0 }
 
         // Encrypt test data with real HLS-style PKCS#7 padding (RFC 8216 5.2).
+        // The pad block is built by hand and encrypted through the suite-wide raw
+        // CBC helper - byte-identical to AES/CBC/PKCS5Padding, but without a
+        // padded-mode Cipher instance in the test source set.
         val plaintext = "encrypted segment data!".toByteArray()
-        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-        val ciphertext = cipher.doFinal(plaintext)
+        val padLen = 16 - (plaintext.size % 16)
+        val paddedPlaintext = plaintext + ByteArray(padLen) { padLen.toByte() }
+        val ciphertext = HlsTestCipher.encryptRaw(paddedPlaintext, key, iv)
 
         // Python decrypts RAW and keeps the pad bytes on disk (`downloader.py`
         // `cipher.decrypt(raw)` -> `store.write_seg(idx, raw)`), so the segment file
         // must contain the padded plaintext, not the trimmed one.
-        val padLen = 16 - (plaintext.size % 16)
-        val paddedPlaintext = plaintext + ByteArray(padLen) { padLen.toByte() }
 
         // M3U8 with encryption
         val m3u8Content = """
@@ -233,9 +228,7 @@ class EpisodeDownloaderTest {
 
         // 32 bytes, final byte 0x00 -> not a legal PKCS#7 pad value.
         val plaintext = ByteArray(32) { 'A'.code.toByte() }.also { it[31] = 0x00 }
-        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-        val ciphertext = cipher.doFinal(plaintext)
+        val ciphertext = HlsTestCipher.encryptRaw(plaintext, key, iv)
 
         val m3u8Content = """
             #EXTM3U
