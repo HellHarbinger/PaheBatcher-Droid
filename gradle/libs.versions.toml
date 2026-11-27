@@ -58,6 +58,7 @@ jose4j = "0.9.6" # CVE-2024-29371 (compressed JWE DoS)
 guava = "33.7.2" # CVE-2026-102554; each graph's constraint appends its flavor (-jre tooling / -android app) to this base
 commonsLang3 = "3.18.0" # CVE-2025-48924 (uncontrolled recursion)
 httpclient = "4.5.14" # CVE-2020-13956 (fixed in 4.5.13; 4.5.14 is also what AGP itself already requires)
+asm = "9.11.1" # org.ow2.asm family: SNYK-JAVA-ORGOW2ASM-21715439/442/445/448/452
 
 [libraries]
 # AndroidX / Compose - compose artifacts are version-managed by the Compose BOM

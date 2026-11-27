@@ -34,6 +34,16 @@ buildscript {
                 .because("Security floor: commons-lang3 ${libs.versions.commonsLang3.get()} (CVE-2025-48924)")
             add("classpath", "org.apache.httpcomponents:httpclient:${libs.versions.httpclient.get()}")
                 .because("Security floor: httpclient ${libs.versions.httpclient.get()} (CVE-2020-13956)")
+            add("classpath", "org.ow2.asm:asm:${libs.versions.asm.get()}")
+                .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+            add("classpath", "org.ow2.asm:asm-tree:${libs.versions.asm.get()}")
+                .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+            add("classpath", "org.ow2.asm:asm-commons:${libs.versions.asm.get()}")
+                .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+            add("classpath", "org.ow2.asm:asm-analysis:${libs.versions.asm.get()}")
+                .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+            add("classpath", "org.ow2.asm:asm-util:${libs.versions.asm.get()}")
+                .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
         }
     }
 }
@@ -70,11 +80,20 @@ dependencies {
 val pbSecurityFloors = dependencies.constraints
 configurations.matching {
     it.name == "androidLintTool" ||
-        it.name.endsWith("kspClasspath") ||
-        it.name.endsWith("KotlinProcessorClasspath")
+        it.name.endsWith("Classpath")
 }.configureEach {
     pbSecurityFloors.add(name, "com.google.guava:guava:${libs.versions.guava.get()}-jre")
         .because("Security floor: guava ${libs.versions.guava.get()}-jre (CVE-2026-102554)")
+    pbSecurityFloors.add(name, "org.ow2.asm:asm:${libs.versions.asm.get()}")
+        .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+    pbSecurityFloors.add(name, "org.ow2.asm:asm-tree:${libs.versions.asm.get()}")
+        .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+    pbSecurityFloors.add(name, "org.ow2.asm:asm-commons:${libs.versions.asm.get()}")
+        .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+    pbSecurityFloors.add(name, "org.ow2.asm:asm-analysis:${libs.versions.asm.get()}")
+        .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+    pbSecurityFloors.add(name, "org.ow2.asm:asm-util:${libs.versions.asm.get()}")
+        .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
     if (name == "androidLintTool") {
         pbSecurityFloors.add(name, "org.bouncycastle:bcprov-jdk18on:${libs.versions.bouncycastle.get()}")
             .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")

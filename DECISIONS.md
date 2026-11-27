@@ -8228,4 +8228,16 @@ and superseded in place with bracketed markers rather than rewritten.
 
 **Scope exclusions for §168.** No branch create/switch/rename/delete, no force-push, no merge, no PR-setting changes, no release-workflow edits, no dependency-submission workflow, no new lockfiles/verification metadata, no unrelated feature changes, no arbitrary security-version changes, no invented CVEs. All Snyk source fixes from §167 decision 9 remain untouched; the eight transitive security floors remain in effect at the same patched versions.
 
+## 169. Security remediation for transitive `org.ow2.asm` vulnerabilities (2026-11-27)
+
+**Context.** Snyk identified vulnerabilities in transitive instances of `org.ow2.asm:asm` and its family (`asm-tree`, `asm-commons`, `asm-analysis`, `asm-util`) introduced by the Android Gradle Plugin (AGP), Kotlin Compose compiler mapping toolchain, and Android Lint tooling configurations.
+
+**Decisions.**
+
+1. **Centralized version declaration.** Declared `asm = "9.11.1"` in `gradle/libs.versions.toml` under `[versions]`.
+2. **Gradle constraints for buildscript and tooling configurations.** Added Gradle dependency constraints for all five members of the `org.ow2.asm` family (`asm`, `asm-tree`, `asm-commons`, `asm-analysis`, `asm-util`) to:
+   * buildscript `classpath` block in `pahebatcher/build.gradle.kts`;
+   * Tooling configurations (`androidLintTool`, `*Classpath`) via `configurations.matching { it.name == "androidLintTool" || it.name.endsWith("Classpath") }`.
+3. **Verification.** Verified with `./gradlew :pahebatcher:dependencies` and `./gradlew :pahebatcher:buildEnvironment` that every transitive `org.ow2.asm` dependency (`9.9`, `9.9.1`, etc.) is raised to `9.11.1`. All unit tests (`1248` debug, `1243` release) and `lintDebug` passed cleanly, and the updated debug APK was deployed to connected device `433aaa40`.
+
 [Back to Index](README.md)
