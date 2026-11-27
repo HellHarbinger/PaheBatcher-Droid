@@ -3547,6 +3547,11 @@ playback mode.**
 > and `.github/dependabot.yml` were removed in the dependency-management
 > simplification round. Entries 54.1, 54.3 and 54.7 are updated below; the rest
 > is unchanged.
+>
+> **Amended 2026-11-27/28 (DECISIONS 170, toolchain/library update round):** 54.4
+> updated (ASM floored at 9.11.1 and graph-verified; Snyk re-scan caveat added),
+> new entries 54.8 (Material3 1.5.0 `Slider` overload deprecation) and 54.9
+> (one-off native Scudo/libhwui abort in one of three device runs).
 
 ### 54.1 [REMOVED 2026-11-27, DECISIONS 168] Dependabot could not update verification checksums
 
@@ -3605,21 +3610,29 @@ playback mode.**
 - **Risk Level:** Low (process/verification gap on a historical diagnosis, not
   code risk).
 
-### 54.4 Residual Snyk OS findings: 5 x `org.ow2.asm` (pre-existing, toolchain-only)
+### 54.4 [REMEDIATED AT GRAPH LEVEL 2026-11-27, DECISIONS 169/170] Snyk OS findings: 5 x `org.ow2.asm`
 
-- **Limitation:** after remediation `snyk test --all-projects` reports 5 MEDIUM
+- **Original limitation:** after remediation `snyk test --all-projects` reported 5 MEDIUM
   issues, all `org.ow2.asm:asm` 9.9/9.9.1 (`Inefficient Algorithmic Complexity`,
   `Memory Allocation with Excessive Size Value`, `Uncontrolled Recursion`) reached
   only through AGP/lint/KSP tooling classpaths (`androidLintTool`, `lint-api`,
   `asm-commons`, `lint-typedef-remover`).
-- **Evidence they are pre-existing:** the advisory IDs
+- **Provenance:** the advisory IDs
   (`SNYK-JAVA-ORGOW2ASM-21715439/442/445/448/452`) appear identically in the
-  pre-change baseline scan; zero new findings were introduced by this round.
-- **Why not pinned away:** asm is not among the eight reported vulnerabilities;
-  pinning a bytecode-manipulation library under AGP/lint/KSP (all of which embed
-  and version-match their own ASM) risks toolchain breakage for a lint-time-only
-  medium - an arbitrary upgrade outside the task's mandate. Revisit when AGP
-  itself ships a fixed ASM.
+  pre-change baseline scan; zero findings were introduced by the rounds that
+  predate the ASM floor.
+- **Status:** the ASM family is now floored at `9.11.1` (catalog `asm`,
+  DECISIONS 169) on the buildscript `classpath`, on `androidLintTool` and on
+  every `*Classpath` tooling configuration. Dependency-graph verification in
+  DECISIONS 170 shows every natural request (`9.9`, `9.9.1`, `8.0.1`) resolved
+  to `9.11.1` on each graph where ASM appears (`classpath`, `androidLintTool`,
+  `composeMappingProducerClasspath`), with assemble, lint, KSP and both unit
+  test variants green under the floor - so the "why not pinned away" rationale
+  previously recorded here (toolchain breakage risk) did not materialize.
+- **Caveat:** a confirming `snyk test` re-scan was NOT run in the 2026-11-27
+  update round (the Snyk CLI is installed but not authenticated on this
+  machine); the remediation claim rests on the resolved dependency graph and a
+  green toolchain, not on a fresh Snyk report.
 - **Risk Level:** Low (compile/lint toolchain only; not shipped in the APK).
 
 ### 54.5 Instrumented full-suite run depends on device unlock state
@@ -3747,5 +3760,52 @@ playback mode.**
   remediated and re-verified, and alerting still works, but a future advisory
   on one of these artifacts - or on any direct dependency - requires a manual
   version bump within the owner's response time rather than an automated PR).
+
+### 54.8 Material3 1.5.0 deprecates the stateless `Slider` overload used at two call sites (2026-11-27, DECISIONS 170)
+
+- **Limitation:** the Compose BOM 2026.11.01 upgrade (Material3 1.5.0) deprecates
+  the `Slider(value, onValueChange, ...)` stateless overload in favour of the
+  `SliderState`-based one. Two production call sites use it and now emit compiler
+  deprecation warnings: `PlayerScreen.kt:324` and `SettingsScreen.kt:824`. Both
+  already pass `onValueChange`, so runtime behavior is unchanged and compilation
+  is unaffected - deprecated, not removed.
+- **Why not migrated in this round:** the round is a dependency update; rewriting
+  the gesture/`SliderState` flow is a source refactor with its own verification
+  burden (seek-drag tests exist: `PlayerSeekSliderDragTest` 4/4) and no functional
+  gain. The migration should be done as a small dedicated change before the
+  overload is ever removed upstream.
+- **Risk Level:** Low (warnings only; behavior verified green in the full battery
+  and on device after the BOM bump).
+
+### 54.9 One-off native Scudo/libhwui abort killed one of three full device runs (2026-11-28, DECISIONS 170)
+
+- **Event:** of three consecutive `connectedDebugAndroidTest` runs of the SAME
+  final debug APK on device `433aaa40`, run 2 aborted mid-suite (563 tests / 82
+  classes recorded, `android-test.testRunFailed` - "Process crashed") with a
+  native tombstone: `Scudo ERROR: corrupted chunk header ... might indicate
+  memory corruption or a double free`, `Fatal signal 6 (SIGABRT)` in the app's
+  `ReferenceQueueD` thread, backtrace through `libhwui.so
+  (RenderNode::~RenderNode)` invoked from `NativeAllocationRegistry$CleanerThunk`
+  (GC cleanup of a system render node) - i.e. heap corruption DETECTED at free
+  time inside the system rendering library, not an app Java/Kotlin fault.
+- **Evidence it is not an upgrade regression:** runs 1 and 3 of the identical
+  APK completed the full suite green-aside-from-the-known-cases with byte-equal
+  results (**663 tests / 106 classes / 1 failure / 0 errors / 3 skipped** each);
+  the failure/skip set is exactly the documented §54.6 pager case + the three
+  FirstEnqueue assumption skips. The crash signature appears NOWHERE in the
+  repository's archived evidence; the device's only other tombstone
+  (`tombstone_00`, 2026-10-28) is an unrelated system `media.swcodec` vp8
+  encoder abort. No memory pressure (5.9 GB available), no thermal issue (30
+  C), device awake with focus on launcher for all runs.
+- **Reproducibility:** 1 of 3; did not recur in the confirming run; no new
+  tombstone after run 3. Non-deterministic native event (a corrupted header can
+  be written long before it is detected).
+- **Why not investigated further:** the abort is in AOSP `libhwui` code paths,
+  the trigger is unreproducible on demand, and the app's own test/production
+  code paths ran green twice in full immediately before and after. Recorded so a
+  recurrence is recognized (same signature = this entry, not a new panic) and
+  re-opened only if it starts reproducing.
+- **Risk Level:** Low (one-off native system-library event; full-suite results
+  confirmed by two clean runs of the same APK).
 
 [Back to Index](README.md)

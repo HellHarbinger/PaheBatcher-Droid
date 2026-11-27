@@ -2263,4 +2263,23 @@ Scope boundary (documented, not hidden): the progress flusher (`updateProgress`,
 - [x] **Docs**: catalog header/ comments de-referenced from lockfiles and `dependabot.yml`; DECISIONS 167 items 4-6/8/11-12 marked superseded/removed; new DECISIONS 168; LIMITATIONS 54.1 stubbed, 54.3/54.7 rewritten; ROADMAP amended. `PARITY.md` untouched (no behavior change).
 - [x] **Validation**: `dependencies`, `buildEnvironment`, `assembleDebug`, `assembleRelease`, `bundleRelease`, `testDebugUnitTest` (1248/0F/0E), `testReleaseUnitTest` (1243/0F/0E), `lintDebug`, `assembleDebugAndroidTest` - BUILD SUCCESSFUL (156 tasks, 3m31s); `git diff --check` clean; full diff reviewed.
 
+## Toolchain & Library Update Round (2026-11-27) - COMPLETE
+
+**Status**: COMPLETED (baseline-first, five gated update groups, final full battery + device suite; DECISIONS 170, LIMITATIONS 54.4 amended, 54.8/54.9 added)
+
+**Goal**: validate PR #13 head `de1bebf`, repair the Guava flavor regression from the ASM matcher broadening, then apply verified-stable AGP/library updates while preserving every security floor.
+
+**Deliverables**:
+- [x] **Baseline before any upgrade** (head `de1bebf`, AGP 9.4.1): full battery BUILD SUCCESSFUL (160 tasks) - unit 1248/1243 (0F/0E/0S), lint 45/48, assembles+bundle+androidTest APK green; instrumentation 577 tests / 5 failures, all 5 classified pre-existing/environmental before proceeding (pager@411dp, 3x FirstEnqueue assumption entries from the AGP 9.4.1 test-engine bug, 1x Unicode live-network probe; baseline XML covered 577 of the full 663 with an adb device error in the log - compared by classification, not raw count).
+- [x] **Guava flavor fix**: `de1bebf`'s broad matcher had put the `-jre` floor on app graphs (all 20 sections `33.7.2-jre`); guarded `-jre` to `androidLintTool`/`*kspClasspath`/`*KotlinProcessorClasspath` only, ASM floors left on the broad matcher - graph re-verified (14 app sections `-android`, 6 tooling sections `-jre`, ASM 9.11.1 everywhere).
+- [x] **G1 AGP 9.4.1 -> 9.5.3** (Gradle 9.8.2 >= required 9.6.0, JDK 25, stable): sync/graph/smoke green; confirmed fix of test-engine issue 563732801 - assumption violations now recorded as `<skipped>` instead of `<failure>`.
+- [x] **G2 Kotlin 2.4.20 -> 2.4.21 + KSP 2.3.12 -> 2.3.14**: sync/graph/smoke green; cleared the `Configuration.setVisible` Gradle-11 deprecation (KSP-side, not AGP).
+- [x] **G3 Compose BOM 2026.08.00 -> 2026.11.01 + compileSdk 37 -> 37.1** (AGP 9 `compileSdk { version = release(37) { minorApiLevel = 1 } }` DSL): green on first run; exactly 2 predicted Material3 1.5.0 `Slider` deprecation warnings (`PlayerScreen.kt:324`, `SettingsScreen.kt:824`) - source deliberately untouched (deprecated != removed).
+- [x] **G4 AndroidX**: coreKtx 1.19.1, lifecycle 2.11.1, navigationCompose 2.10.2, datastore 1.3.0, workmanager 2.12.0, testCore 1.7.0, testRunner 1.7.0, testExtJunit 1.3.0 - sync/graph/smoke green, all resolved as requested.
+- [x] **G5 others**: okhttp 4.12.1 (certificate-blocklist fix), serialization 1.13.0 (transitive 1.8.1 raised correctly), ffmpegkit 8.1.9 - sync/graph/smoke green.
+- [x] **Rejected with reason**: okhttp 5.x (major), media3 1.12.0-rc01 (RC), Kotlin 2.5.0 (RC), KSP 2.3.13 (regression #3286); room/activityCompose/coroutines/junit/smartexception already latest stable.
+- [x] **Final battery**: BUILD SUCCESSFUL (162 tasks) - unit 1248/1243 (0F/0E/0S), lint 27/30, assembles+bundle+androidTest APK green, floor pin map verified on every graph, 0 `{strictly}` lines, no lockfile/verification references.
+- [x] **Final instrumentation** (device `433aaa40`, fresh install, awake): **663 tests / 1 failure / 0 errors / 3 skipped** - the 1 failure is the documented 54.6 pager width case (re-verified PASS at `wm density 375` = 460.8dp, density reset after); the 3 skips are the FirstEnqueue assumptions now correctly classified; Unicode + Phase17 live-network suites passed. A second consecutive full run reproduced the identical 663/1F/0E/3S result (28m27s); an intermediate run aborted with a one-off native Scudo/libhwui abort classified in LIMITATIONS 54.9 (2 of 3 runs clean, identical results).
+- [x] **Honest exclusions**: Snyk CLI installed but unauthenticated - skipped and documented; Android Studio Upgrade Assistant GUI not automatable - manual equivalent documented (DECISIONS 170.4); `git diff --check` clean, full diff reviewed (2 build files + 3 doc files, all in scope).
+
 [Back to Index](README.md)

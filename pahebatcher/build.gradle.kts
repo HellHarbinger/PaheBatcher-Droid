@@ -72,18 +72,28 @@ dependencies {
     }
 }
 
-// JVM-only tooling graphs (lint tool + KSP processor paths) are created by
-// AGP/KSP plugins and resolve guava's -jre flavor; androidLintTool
-// additionally carries the BouncyCastle, commons-lang3 and httpclient
-// pins. These configurations cannot be reached from the dependencies
-// block, so each is floored as it appears.
+// Configurations created by AGP/KSP plugins that cannot be reached from the
+// dependencies block are floored as they appear. The matcher is broad
+// (`*Classpath` + androidLintTool) so every tooling graph carries the ASM
+// family floors, but guava's -jre flavor is applied ONLY to the JVM tooling
+// graphs (lint tool + KSP processor paths): the app variant classpaths
+// (debugRuntimeClasspath, debugLintChecksClasspath, ...) also match
+// `*Classpath`, and flooring them with -jre would collide with the -android
+// flavor their graphs resolve by design (see the constraints block above).
+// androidLintTool additionally carries the BouncyCastle, commons-lang3 and
+// httpclient pins.
 val pbSecurityFloors = dependencies.constraints
 configurations.matching {
     it.name == "androidLintTool" ||
         it.name.endsWith("Classpath")
 }.configureEach {
-    pbSecurityFloors.add(name, "com.google.guava:guava:${libs.versions.guava.get()}-jre")
-        .because("Security floor: guava ${libs.versions.guava.get()}-jre (CVE-2026-102554)")
+    if (name == "androidLintTool" ||
+        name.endsWith("kspClasspath") ||
+        name.endsWith("KotlinProcessorClasspath")
+    ) {
+        pbSecurityFloors.add(name, "com.google.guava:guava:${libs.versions.guava.get()}-jre")
+            .because("Security floor: guava ${libs.versions.guava.get()}-jre (CVE-2026-102554)")
+    }
     pbSecurityFloors.add(name, "org.ow2.asm:asm:${libs.versions.asm.get()}")
         .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
     pbSecurityFloors.add(name, "org.ow2.asm:asm-tree:${libs.versions.asm.get()}")
@@ -217,7 +227,12 @@ if (providers.environmentVariable("CI").orNull == "true" && pbReleaseArtifactReq
 
 android {
     namespace = "com.pahebatcher.app"
-    compileSdk = 37
+    // Compose BOM 2026.11.01 (Compose 1.13) AAR metadata requires compiling
+    // against API 37.1; the minor API level is expressed through the AGP 9
+    // compileSdk DSL (android-37.1 platform installed in the SDK).
+    compileSdk {
+        version = release(37) { minorApiLevel = 1 }
+    }
 
     defaultConfig {
         applicationId = "com.pahebatcher.app"

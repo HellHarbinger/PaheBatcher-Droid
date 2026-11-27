@@ -6,45 +6,45 @@
 
 [versions]
 # Build plugins / toolchain (see DECISIONS.md Decision 17 for the verified baseline)
-agp = "9.4.1"
-kotlin = "2.4.20"
-ksp = "2.3.12"
-composeBom = "2026.08.00"
+agp = "9.5.3"
+kotlin = "2.4.21"
+ksp = "2.3.14"
+composeBom = "2026.11.01"
 
 # AndroidX core
 activityCompose = "1.13.0"
-coreKtx = "1.19.0"
+coreKtx = "1.19.1"
 
 # Lifecycle - one release line shared by runtime-ktx, viewmodel-compose and runtime-compose
-lifecycle = "2.11.0"
+lifecycle = "2.11.1"
 
 # Database and persistence
 room = "2.8.5"
-datastore = "1.2.1"
+datastore = "1.3.0"
 
 # Coroutines and serialization
 coroutines = "1.11.0"
-serialization = "1.11.0"
+serialization = "1.13.0"
 
 # Networking
-okhttp = "4.12.0"
+okhttp = "4.12.1"
 
 # Media
-ffmpegkit = "8.1.7"
+ffmpegkit = "8.1.9"
 smartexception = "0.2.1"
 media3 = "1.11.1"
 
 # Background processing
-workmanager = "2.11.2"
+workmanager = "2.12.0"
 
 # Navigation
-navigationCompose = "2.10.1"
+navigationCompose = "2.10.2"
 
 # Testing
 junit = "4.13.2"
-testCore = "1.6.1"
-testRunner = "1.6.2"
-testExtJunit = "1.2.1"
+testCore = "1.7.0"
+testRunner = "1.7.0"
+testExtJunit = "1.3.0"
 
 # Security floors for vulnerable TRANSITIVE dependencies, applied as Gradle
 # dependency constraints in pahebatcher/build.gradle.kts (buildscript
