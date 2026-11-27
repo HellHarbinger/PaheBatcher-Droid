@@ -3543,30 +3543,23 @@ playback mode.**
 
 ## 54. Build simplification / dependency security round (DECISIONS 167, 2026-11-25) - platform gaps and accepted residuals
 
-### 54.1 Dependabot cannot update `gradle/verification-metadata.xml` checksums (dependabot-core#1996, open upstream)
+> **Amended 2026-11-27 (DECISIONS 168):** lockfiles, `gradle/verification-metadata.xml`
+> and `.github/dependabot.yml` were removed in the dependency-management
+> simplification round. Entries 54.1, 54.3 and 54.7 are updated below; the rest
+> is unchanged.
 
-- **Limitation:** Gradle dependency verification rejects any artifact whose SHA-256
-  is absent from `gradle/verification-metadata.xml`. dependabot-core does not write
-  or amend that file when it opens a Gradle version-update PR, so a merged
-  Dependabot PR that changes any resolved artifact will fail the next build with a
-  verification error until the checksums are regenerated.
-- **Affected features:** every future Dependabot Gradle PR (version updates AND
-  security updates); CI verification gates in `release-artifact-v2.yml`.
-- **Workaround (documented, not automated):** after merging any Dependabot Gradle
-  PR, regenerate locks + checksums locally and commit them together with the PR's
-  changes:
-  `./gradlew --write-verification-metadata sha256 --write-locks :pahebatcher:dependencies :pahebatcher:buildEnvironment :pahebatcher:assembleDebug :pahebatcher:assembleRelease :pahebatcher:bundleRelease :pahebatcher:testDebugUnitTest :pahebatcher:testReleaseUnitTest :pahebatcher:lintDebug :pahebatcher:assembleDebugAndroidTest`
-  (the command is also recorded in `.github/dependabot.yml` header comments).
-- **Why not disabled:** disabling verification to accommodate the bot would weaken
-  supply-chain integrity for every build, which the task rules forbid. The gap is
-  an upstream defect; tracking issue: dependabot-core#1996.
-- **Related upstream fix (partial, NOT sufficient on its own):**
-  dependabot-core#16669 (merged 2026-11-10) teaches the Gradle updater to
-  parse `gradle.lockfile`, so lockfile-resolved versions are at least visible
-  to the updater. Per GitHub's documentation this does NOT by itself create
-  security-update coverage for transitive-only artifacts - see 54.7.
-- **Risk Level:** Low-Medium (build breakage, not a security hole; one documented
-  command resolves it).
+### 54.1 [REMOVED 2026-11-27, DECISIONS 168] Dependabot could not update verification checksums
+
+- Formerly: dependabot-core#1996 - Dependabot does not write
+  `gradle/verification-metadata.xml`, so merged Gradle PRs needed a local
+  `--write-verification-metadata sha256 --write-locks` regeneration.
+- **Why removed:** the whole lockfile + verification-metadata layer this
+  limitation described was deleted in DECISIONS 168 (all of it was introduced
+  by this PR; base `629bcea` had none of it), together with
+  `.github/dependabot.yml`. There is no checksum file to regenerate and no
+  regeneration command to document. The security floors remain enforced as
+  ordinary Gradle constraints on every build. Upstream issue dependabot-core#1996
+  still exists but no longer affects this repository.
 
 ### 54.2 Three inherent Snyk Code findings remain (19 -> 3; 0 suppressed)
 
@@ -3597,20 +3590,20 @@ playback mode.**
   (`/network/updates/1728130935`) requires repository write access (403/404
   unauthenticated; no `gh` CLI/token available in this environment), and the task
   rules forbid pushing or changing GitHub settings to trigger a fresh security
-  update. The root-cause conclusion therefore rests on repository-side hard
-  evidence (manifest scans at the failing SHAs, API job metadata, dependabot-core
-  issue classes), not on the updater's own log.
-- **Affected Features:** confidence bound on the Phase 5 diagnosis; the claim that
-  a subsequent GitHub-hosted security update will now succeed is NOT verified.
-- **What WAS validated locally:** the version catalog + lockfiles parse into a
-  complete, pin-enforced dependency graph (`dependencies`/`buildEnvironment`
-  reports show all eight remediated versions). This confirms the pins are
-  enforced locally; it does NOT establish that the GitHub-hosted security
-  updater will act on them (see 54.7).
-- **Manual action for the owner (GitHub side, not performable here):** after
-  pushing these changes, either wait for the next scheduled/adaptive security run
-  or trigger one from the repository's Security tab, and confirm it opens a PR.
-- **Risk Level:** Low (process/verification gap, not code risk).
+  update. The root-cause conclusion (DECISIONS 167.7) therefore rests on
+  repository-side hard evidence (manifest scans at the failing SHAs, API job
+  metadata, dependabot-core issue classes), not on the updater's own log.
+- **Status after DECISIONS 168:** `.github/dependabot.yml` was removed, so there
+  is no configured Dependabot run to re-trigger or verify - the failed-run
+  diagnosis is now historical context for why no such configuration is kept.
+  What remains live is the local half of the old claim: the version catalog plus
+  the Gradle security-floor constraints resolve into a complete, patched
+  dependency graph (`dependencies`/`buildEnvironment` reports show all eight
+  remediated versions on every graph). That establishes local enforcement only;
+  it says nothing about GitHub's updater, which this repository no longer
+  configures.
+- **Risk Level:** Low (process/verification gap on a historical diagnosis, not
+  code risk).
 
 ### 54.4 Residual Snyk OS findings: 5 x `org.ow2.asm` (pre-existing, toolchain-only)
 
@@ -3700,59 +3693,59 @@ playback mode.**
 
 ### 54.7 Dependabot security updates for the pinned Gradle transitive dependencies are NOT established - manual remediation is required
 
-- **Limitation:** the repository's configuration does not automate security
-  updates for the seven pinned transitive dependencies (guava, commons-lang3,
-  httpclient, jose4j, bcpkix-jdk18on, bcprov-jdk18on, jdom2), and there is no
-  evidence that GitHub's Gradle security-update machinery can do so. Official
-  GitHub documentation ("About Dependabot security updates") states:
+- **Limitation:** there is no automated security-update path for the eight
+  pinned transitive dependencies (guava, commons-lang3, httpclient, jose4j,
+  bcpkix-jdk18on, bcprov-jdk18on, bcutil-jdk18on, jdom2), and there is no
+  evidence that GitHub's Gradle security-update machinery can provide one.
+  Official GitHub documentation ("About Dependabot security updates") states:
     1. "security updates are triggered only for dependencies that are
        specified in a manifest or lock file"; and
     2. for ecosystems other than npm (and NuGet `PackageReference`),
        "Dependabot can't update an indirect or transitive dependency if doing
        so would also require updating the parent dependency."
-  These seven exist only as AGP/lint/KSP/Media3 tooling transitives; fixing a
+  These eight exist only as AGP/lint/KSP/Media3 tooling transitives; fixing a
   future advisory would require changing the parent dependency (AGP/KSP) or
   adding direct pins - Dependabot does not add direct pins for Gradle (that
   behavior is documented only for NuGet), and adding artificial direct
   dependencies to the application graph was explicitly ruled out by the
   review. The one observed security-update run (45431153460) failed with
   "no files changed" (DECISIONS 167.7), and no successful GitHub-hosted
-  security-update run has been observed for these artifacts. The presence of
-  lockfiles, version-catalog pin entries and resolution rules improves LOCAL
-  remediation and visibility; it is not evidence of Dependabot
-  security-update support.
-- **The four mechanisms, distinguished:** (a) *remediation now* = Gradle
-  minimum-version pins (catalog + `resolutionStrategy.eachDependency`),
-  enforced on every build regardless of Dependabot; (b) *locking + SHA-256
-  verification* = deterministic, tamper-evident resolution - not update
-  automation; (c) *Dependabot version updates* = configured and retained for
-  dependencies declared in the supported manifests (catalog, build files,
-  workflow actions), with each merged Gradle PR still needing the local
-  regeneration command of 54.1 because of dependabot-core#1996; (d)
-  *Dependabot security updates* = not established for these transitive
-  dependencies (above).
-- **Actual maintenance/remediation process required for the seven pins:**
+  security-update run has been observed for these artifacts.
+- **Current configuration (after DECISIONS 168):** `.github/dependabot.yml`
+  was removed along with the lockfiles and verification metadata - the
+  configuration existed only to work around the updater's limitations and to
+  document the lock/checksum regeneration flow, both of which are gone. So the
+  repository now has NO Dependabot configuration at all: no scheduled version
+  PRs and no security-update PRs for any dependency. The mechanisms are:
+  (a) *remediation now* = Gradle dependency floors (catalog versions +
+  `constraints { ... }` with `because(...)` reasons in
+  `pahebatcher/build.gradle.kts`), enforced on every local and CI build
+  regardless of any bot; (b) *Dependabot version updates* = none configured -
+  version bumps for declared dependencies are a manual, owner-driven change
+  (bump the catalog, run the battery, commit); (c) *Dependabot security
+  updates* = not established for these transitive dependencies (above), and no
+  longer configured for direct ones either. Repository Dependabot alerts (the
+  read-only advisory notifications) are a GitHub-side feature of the dependency
+  graph and are unaffected by removing the configuration file.
+- **Actual maintenance/remediation process required for the eight pins:**
     1. Monitor advisories: repository Dependabot alerts (alerts still fire for
        every vulnerable dependency in the graph even when no update PR can be
        opened), `snyk test`, and the GitHub Advisory Database.
     2. When a fixed version exists, bump the pin in `gradle/libs.versions.toml`
-       (pins are MINIMUM versions - a newer request from the toolchain already
-       passes through unchanged, so a bump only raises the floor).
-    3. Regenerate locks + checksums together in one invocation (never locks
-       alone - see 54.1): the `--write-verification-metadata sha256
-       --write-locks <tasks>` command documented in `.github/dependabot.yml`.
-    4. Run the build/test battery, then commit the catalog, the three lockfiles
-       and `gradle/verification-metadata.xml` in one change.
-    5. For DIRECT dependencies, Dependabot version-update PRs remain the
-       automated path; apply the same regeneration step after merging them.
+       (floors are MINIMUM versions - a newer request from the toolchain
+       already passes through unchanged, so a bump only raises the floor).
+    3. Run the build/test battery
+       (`assembleDebug/assembleRelease/bundleRelease/testDebugUnitTest/
+       testReleaseUnitTest/lintDebug/assembleDebugAndroidTest`), then commit
+       the catalog and the constraint block if its comment text changed.
+    4. There are no lockfiles or checksum files to regenerate (DECISIONS 168).
 - **Affected features:** automated security patching of the pinned transitive
-  dependencies (manual instead); the Dependabot alert-to-PR flow for them.
-  Everything else about the pipeline (version updates for declared
-  dependencies, GitHub Actions updates, local pin enforcement, dependency
-  verification) is unaffected.
+  dependencies (manual instead); Dependabot PR flows of any kind (none
+  configured). Everything else about the pipeline (local floor enforcement,
+  build/test gates, release workflow) is unaffected.
 - **Risk Level:** Medium (the eight reported vulnerabilities are currently
   remediated and re-verified, and alerting still works, but a future advisory
-  on one of these artifacts requires a manual pin bump within the owner's
-  response time rather than an automated PR).
+  on one of these artifacts - or on any direct dependency - requires a manual
+  version bump within the owner's response time rather than an automated PR).
 
 [Back to Index](README.md)

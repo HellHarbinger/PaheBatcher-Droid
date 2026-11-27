@@ -1,11 +1,8 @@
 # Central version catalog - the single source of truth for every external
-# dependency and plugin version in this repository.
-#
-# After changing a version here, regenerate the dependency lock state and the
-# dependency verification metadata TOGETHER in one invocation (--write-locks
-# alone fails verification for newly resolved artifacts; see DECISIONS.md 167):
-#   ./gradlew --write-verification-metadata sha256 --write-locks <build tasks>
-# The full task list is documented in .github/dependabot.yml.
+# dependency and plugin version in this repository. Security floors for
+# vulnerable transitive dependencies are applied as Gradle constraints in
+# pahebatcher/build.gradle.kts, read from the pin versions below
+# (DECISIONS.md 167).
 
 [versions]
 # Build plugins / toolchain (see DECISIONS.md Decision 17 for the verified baseline)
@@ -49,15 +46,16 @@ testCore = "1.6.1"
 testRunner = "1.6.2"
 testExtJunit = "1.2.1"
 
-# Security pins for vulnerable TRANSITIVE dependencies, applied by
-# ResolutionStrategy.applySecurityPins() in pahebatcher/build.gradle.kts.
+# Security floors for vulnerable TRANSITIVE dependencies, applied as Gradle
+# dependency constraints in pahebatcher/build.gradle.kts (buildscript
+# classpath, androidLintTool, KSP processor paths and the app graphs).
 # The introducing dependencies are pinned by Google (AGP/lint toolchain) or are
 # runtime libraries we do not own (Media3's guava-android), so each value is the
 # patched release required by the advisory noted beside it.
 bouncycastle = "1.86" # bcprov/bcpkix/bcutil family, kept aligned: CVE-2026-8763, CVE-2026-13506, CVE-2026-5588 and every other advisory affecting 1.80.2
 jdom2 = "2.0.6.1" # CVE-2021-33813 (XXE)
 jose4j = "0.9.6" # CVE-2024-29371 (compressed JWE DoS)
-guava = "33.7.2" # CVE-2026-102554; the -android / -jre flavor suffix is appended by the pin logic
+guava = "33.7.2" # CVE-2026-102554; each graph's constraint appends its flavor (-jre tooling / -android app) to this base
 commonsLang3 = "3.18.0" # CVE-2025-48924 (uncontrolled recursion)
 httpclient = "4.5.14" # CVE-2020-13956 (fixed in 4.5.13; 4.5.14 is also what AGP itself already requires)
 

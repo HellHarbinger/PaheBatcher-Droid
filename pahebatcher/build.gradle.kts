@@ -1,173 +1,39 @@
 // ---------------------------------------------------------------------------
-// Security pins for vulnerable TRANSITIVE dependencies
+// Security floors for vulnerable TRANSITIVE dependencies
 // ---------------------------------------------------------------------------
-// The AGP/lint toolchain introduces several vulnerable transitive libraries
-// (BouncyCastle, jose4j, jdom2, commons-lang3, guava, httpclient) that cannot
-// be reached through the dependency block - they live on the plugin classpath
-// and on tooling-only configurations (androidLintTool, ksp processor paths).
-// They are pinned to patched versions declared centrally in
-// gradle/libs.versions.toml. Pins are MINIMUM versions: they only ever
-// upgrade a requested version, never downgrade one, so a future toolchain
-// that ships a newer (already-patched) release is left alone.
-// These pins are enforced by Gradle itself in every local and CI build; they
-// are NOT managed by Dependabot. Dependabot version updates cover only
-// dependencies declared in the supported manifests, and security updates for
-// these transitive-only artifacts are not established (LIMITATIONS.md 54.7).
-// The version comparison and Guava flavor decision live in buildSrc
-// (PbDependencyVersions.kt) so they are unit-tested: the project-level
-// helpers below import them, while the buildscript block - which compiles in
-// a separate pass that does not apply file-level imports - references them
-// fully-qualified. Rationale and advisory mapping: DECISIONS.md.
-
-import com.pahebatcher.buildlogic.pbGuavaFlavor
-import com.pahebatcher.buildlogic.pbGuavaTargetVersion
-import com.pahebatcher.buildlogic.pbVersionAtLeast
-
-/** Central pin versions read from the gradle/libs.versions.toml catalog. */
-fun pbSecurityPins(): Map<String, String> = mapOf(
-    "bouncycastle" to libs.versions.bouncycastle.get(),
-    "jdom2" to libs.versions.jdom2.get(),
-    "jose4j" to libs.versions.jose4j.get(),
-    "guava" to libs.versions.guava.get(),
-    "commonsLang3" to libs.versions.commonsLang3.get(),
-    "httpclient" to libs.versions.httpclient.get(),
-)
-
-/**
- * Applies the security pins to a single dependency request.
- *
- * [configurationName] is required only for guava, whose artifact has two
- * publishable flavors: the JVM tooling classpaths (buildscript classpath,
- * androidLintTool, ksp processor classpaths) resolve the -jre flavor, while
- * every other configuration in this project (compile/runtime/lint-checks/
- * annotation-processor classpaths) resolves the -android flavor. The flavor is
- * chosen from the configuration so the two can never collide within one
- * graph; both flavors carry the same patched base version.
- */
-fun DependencyResolveDetails.pbApplySecurityPins(
-    configurationName: String,
-    pins: Map<String, String>,
-) {
-    val group = requested.group ?: return
-    val artifact = requested.name ?: return
-    val version = requested.version ?: return
-
-    when {
-        group == "org.bouncycastle" && artifact.endsWith("-jdk18on") -> {
-            val pin = pins.getValue("bouncycastle")
-            if (!pbVersionAtLeast(version, pin)) {
-                useVersion(pin)
-                because(
-                    "Security pin: BouncyCastle jdk18on family aligned to $pin " +
-                        "(CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)"
-                )
-            }
-        }
-
-        group == "org.jdom" && artifact == "jdom2" -> {
-            val pin = pins.getValue("jdom2")
-            if (!pbVersionAtLeast(version, pin)) {
-                useVersion(pin)
-                because("Security pin: jdom2 $pin (CVE-2021-33813, XXE)")
-            }
-        }
-
-        group == "org.bitbucket.b_c" && artifact == "jose4j" -> {
-            val pin = pins.getValue("jose4j")
-            if (!pbVersionAtLeast(version, pin)) {
-                useVersion(pin)
-                because("Security pin: jose4j $pin (CVE-2024-29371, DoS)")
-            }
-        }
-
-        group == "com.google.guava" && artifact == "guava" -> {
-            val pin = pins.getValue("guava")
-            val flavor = pbGuavaFlavor(configurationName)
-            // Decision logic lives in buildSrc and is unit-tested: a newer
-            // requested base is ALWAYS preserved (flavor applied to it), a
-            // sub-pin request is raised to the pin, and an already-correct
-            // request is not rewritten - flavor selection never downgrades.
-            val target = pbGuavaTargetVersion(version, pin, flavor)
-            if (target != version) {
-                useVersion(target)
-                because("Security pin: guava $target (CVE-2026-102554)")
-            }
-        }
-
-        group == "org.apache.commons" && artifact == "commons-lang3" -> {
-            val pin = pins.getValue("commonsLang3")
-            if (!pbVersionAtLeast(version, pin)) {
-                useVersion(pin)
-                because("Security pin: commons-lang3 $pin (CVE-2025-48924)")
-            }
-        }
-
-        group == "org.apache.httpcomponents" && artifact == "httpclient" -> {
-            val pin = pins.getValue("httpclient")
-            if (!pbVersionAtLeast(version, pin)) {
-                useVersion(pin)
-                because("Security pin: httpclient $pin (CVE-2020-13956)")
-            }
-        }
-    }
-}
-
-// Buildscript classpath pins (plugin/AGP toolchain transitives). NOTE: this
-// block compiles in a separate pass that cannot see script-level declarations,
-// so the pin MAP is duplicated locally; the version comparison and Guava
-// flavor decision come from buildSrc, which is on the classpath of every
-// build script, so both passes share ONE tested implementation. The shared
-// helpers above serve every project configuration instead.
+// The AGP/lint/KSP toolchain and Media3 introduce several vulnerable
+// transitive libraries (BouncyCastle, jose4j, jdom2, commons-lang3, guava,
+// httpclient) that cannot be reached through normal dependency declarations
+// - they live on the plugin classpath and on tooling-only configurations
+// (androidLintTool, KSP processor paths). Each one is floored to the
+// patched version declared centrally in gradle/libs.versions.toml, using
+// ordinary Gradle dependency CONSTRAINTS: conflict resolution always
+// selects the highest requested version, so a floor only ever raises a
+// request - it can never downgrade a newer toolchain request, and a
+// prerelease below the floor never wins. Guava publishes its JVM/Android
+// split inside the version string (-jre / -android) and every graph here
+// resolves exactly one flavor, so each floor carries the flavor of the
+// graph it constrains (-jre for JVM tooling graphs, -android for the app
+// graphs where Media3's request lives). Advisory mapping: DECISIONS.md 167.
 buildscript {
-    // Lock the plugin/AGP classpath too (separate gradle.lockfile for the
-    // buildscript: buildscript-gradle.lockfile).
-    configurations.classpath {
-        resolutionStrategy.activateDependencyLocking()
-    }
-    val pbPins = mapOf(
-        "bouncycastle" to libs.versions.bouncycastle.get(),
-        "jdom2" to libs.versions.jdom2.get(),
-        "jose4j" to libs.versions.jose4j.get(),
-        "guava" to libs.versions.guava.get(),
-        "commonsLang3" to libs.versions.commonsLang3.get(),
-        "httpclient" to libs.versions.httpclient.get(),
-    )
-    configurations.all {
-        resolutionStrategy.eachDependency {
-            val g = requested.group ?: return@eachDependency
-            val n = requested.name ?: return@eachDependency
-            val v = requested.version ?: return@eachDependency
-            when {
-                g == "org.bouncycastle" && n.endsWith("-jdk18on") -> {
-                    val pin = pbPins.getValue("bouncycastle")
-                    if (!com.pahebatcher.buildlogic.pbVersionAtLeast(v, pin)) useVersion(pin)
-                }
-                g == "org.jdom" && n == "jdom2" -> {
-                    val pin = pbPins.getValue("jdom2")
-                    if (!com.pahebatcher.buildlogic.pbVersionAtLeast(v, pin)) useVersion(pin)
-                }
-                g == "org.bitbucket.b_c" && n == "jose4j" -> {
-                    val pin = pbPins.getValue("jose4j")
-                    if (!com.pahebatcher.buildlogic.pbVersionAtLeast(v, pin)) useVersion(pin)
-                }
-                g == "com.google.guava" && n == "guava" -> {
-                    // The buildscript classpath always runs on the JVM: -jre
-                    // flavor. pbGuavaTargetVersion preserves any newer
-                    // requested base instead of forcing the pin (the old
-                    // inline check downgraded e.g. 34.0.0-jre to 33.7.2-jre).
-                    val pin = pbPins.getValue("guava")
-                    val target = com.pahebatcher.buildlogic.pbGuavaTargetVersion(v, pin, "jre")
-                    if (target != v) useVersion(target)
-                }
-                g == "org.apache.commons" && n == "commons-lang3" -> {
-                    val pin = pbPins.getValue("commonsLang3")
-                    if (!com.pahebatcher.buildlogic.pbVersionAtLeast(v, pin)) useVersion(pin)
-                }
-                g == "org.apache.httpcomponents" && n == "httpclient" -> {
-                    val pin = pbPins.getValue("httpclient")
-                    if (!com.pahebatcher.buildlogic.pbVersionAtLeast(v, pin)) useVersion(pin)
-                }
-            }
+    dependencies {
+        constraints {
+            add("classpath", "com.google.guava:guava:${libs.versions.guava.get()}-jre")
+                .because("Security floor: guava ${libs.versions.guava.get()}-jre (CVE-2026-102554)")
+            add("classpath", "org.bouncycastle:bcprov-jdk18on:${libs.versions.bouncycastle.get()}")
+                .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+            add("classpath", "org.bouncycastle:bcpkix-jdk18on:${libs.versions.bouncycastle.get()}")
+                .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+            add("classpath", "org.bouncycastle:bcutil-jdk18on:${libs.versions.bouncycastle.get()}")
+                .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+            add("classpath", "org.jdom:jdom2:${libs.versions.jdom2.get()}")
+                .because("Security floor: jdom2 ${libs.versions.jdom2.get()} (CVE-2021-33813, XXE)")
+            add("classpath", "org.bitbucket.b_c:jose4j:${libs.versions.jose4j.get()}")
+                .because("Security floor: jose4j ${libs.versions.jose4j.get()} (CVE-2024-29371, DoS)")
+            add("classpath", "org.apache.commons:commons-lang3:${libs.versions.commonsLang3.get()}")
+                .because("Security floor: commons-lang3 ${libs.versions.commonsLang3.get()} (CVE-2025-48924)")
+            add("classpath", "org.apache.httpcomponents:httpclient:${libs.versions.httpclient.get()}")
+                .because("Security floor: httpclient ${libs.versions.httpclient.get()} (CVE-2020-13956)")
         }
     }
 }
@@ -179,25 +45,48 @@ plugins {
     alias(libs.plugins.serialization)
 }
 
-// Project configurations (compile/runtime/ksp/lint/annotation-processor classpaths):
-// same pins as the buildscript classpath above.
-configurations.all {
-    val pbPins = pbSecurityPins()
-    val pbConfigurationName = name
-    resolutionStrategy.eachDependency {
-        pbApplySecurityPins(pbConfigurationName, pbPins)
+// App/test/lint-check graphs: guava resolves the -android flavor (Media3
+// requests 33.3.1-android, and kotlinx-coroutines-guava's -jre request
+// joins the same graphs, where conflict resolution picks one highest
+// version - the floor keeps every graph on the patched release). The
+// declarable parents below cover their variant classpaths through
+// configuration inheritance.
+dependencies {
+    constraints {
+        add("implementation", "com.google.guava:guava:${libs.versions.guava.get()}-android")
+            .because("Security floor: guava ${libs.versions.guava.get()}-android (CVE-2026-102554)")
+        add("androidTestImplementation", "com.google.guava:guava:${libs.versions.guava.get()}-android")
+            .because("Security floor: guava ${libs.versions.guava.get()}-android (CVE-2026-102554)")
+        add("lintChecks", "com.google.guava:guava:${libs.versions.guava.get()}-android")
+            .because("Security floor: guava ${libs.versions.guava.get()}-android (CVE-2026-102554)")
     }
 }
 
-// Dependency locking: every project configuration resolves against the checked
-// in pahebatcher/gradle.lockfile (the buildscript classpath locks into
-// pahebatcher/buildscript-gradle.lockfile, activated above). After any
-// intentional version change regenerate locks AND checksums TOGETHER (locks
-// alone fail dependency verification for newly resolved artifacts):
-//   ./gradlew --write-verification-metadata sha256 --write-locks <build tasks>
-// The full task list is documented in .github/dependabot.yml.
-dependencyLocking {
-    lockAllConfigurations()
+// JVM-only tooling graphs (lint tool + KSP processor paths) are created by
+// AGP/KSP plugins and resolve guava's -jre flavor; androidLintTool
+// additionally carries the BouncyCastle, commons-lang3 and httpclient
+// pins. These configurations cannot be reached from the dependencies
+// block, so each is floored as it appears.
+val pbSecurityFloors = dependencies.constraints
+configurations.matching {
+    it.name == "androidLintTool" ||
+        it.name.endsWith("kspClasspath") ||
+        it.name.endsWith("KotlinProcessorClasspath")
+}.configureEach {
+    pbSecurityFloors.add(name, "com.google.guava:guava:${libs.versions.guava.get()}-jre")
+        .because("Security floor: guava ${libs.versions.guava.get()}-jre (CVE-2026-102554)")
+    if (name == "androidLintTool") {
+        pbSecurityFloors.add(name, "org.bouncycastle:bcprov-jdk18on:${libs.versions.bouncycastle.get()}")
+            .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+        pbSecurityFloors.add(name, "org.bouncycastle:bcpkix-jdk18on:${libs.versions.bouncycastle.get()}")
+            .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+        pbSecurityFloors.add(name, "org.bouncycastle:bcutil-jdk18on:${libs.versions.bouncycastle.get()}")
+            .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+        pbSecurityFloors.add(name, "org.apache.commons:commons-lang3:${libs.versions.commonsLang3.get()}")
+            .because("Security floor: commons-lang3 ${libs.versions.commonsLang3.get()} (CVE-2025-48924)")
+        pbSecurityFloors.add(name, "org.apache.httpcomponents:httpclient:${libs.versions.httpclient.get()}")
+            .because("Security floor: httpclient ${libs.versions.httpclient.get()} (CVE-2020-13956)")
+    }
 }
 
 // ---------------------------------------------------------------------------
