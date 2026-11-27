@@ -1,8 +1,121 @@
+// ---------------------------------------------------------------------------
+// Security floors for vulnerable TRANSITIVE dependencies
+// ---------------------------------------------------------------------------
+// The AGP/lint/KSP toolchain and Media3 introduce several vulnerable
+// transitive libraries (BouncyCastle, jose4j, jdom2, commons-lang3, guava,
+// httpclient) that cannot be reached through normal dependency declarations
+// - they live on the plugin classpath and on tooling-only configurations
+// (androidLintTool, KSP processor paths). Each one is floored to the
+// patched version declared centrally in gradle/libs.versions.toml, using
+// ordinary Gradle dependency CONSTRAINTS: conflict resolution always
+// selects the highest requested version, so a floor only ever raises a
+// request - it can never downgrade a newer toolchain request, and a
+// prerelease below the floor never wins. Guava publishes its JVM/Android
+// split inside the version string (-jre / -android) and every graph here
+// resolves exactly one flavor, so each floor carries the flavor of the
+// graph it constrains (-jre for JVM tooling graphs, -android for the app
+// graphs where Media3's request lives). Advisory mapping: DECISIONS.md 167.
+buildscript {
+    dependencies {
+        constraints {
+            add("classpath", "com.google.guava:guava:${libs.versions.guava.get()}-jre")
+                .because("Security floor: guava ${libs.versions.guava.get()}-jre (CVE-2026-102554)")
+            add("classpath", "org.bouncycastle:bcprov-jdk18on:${libs.versions.bouncycastle.get()}")
+                .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+            add("classpath", "org.bouncycastle:bcpkix-jdk18on:${libs.versions.bouncycastle.get()}")
+                .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+            add("classpath", "org.bouncycastle:bcutil-jdk18on:${libs.versions.bouncycastle.get()}")
+                .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+            add("classpath", "org.jdom:jdom2:${libs.versions.jdom2.get()}")
+                .because("Security floor: jdom2 ${libs.versions.jdom2.get()} (CVE-2021-33813, XXE)")
+            add("classpath", "org.bitbucket.b_c:jose4j:${libs.versions.jose4j.get()}")
+                .because("Security floor: jose4j ${libs.versions.jose4j.get()} (CVE-2024-29371, DoS)")
+            add("classpath", "org.apache.commons:commons-lang3:${libs.versions.commonsLang3.get()}")
+                .because("Security floor: commons-lang3 ${libs.versions.commonsLang3.get()} (CVE-2025-48924)")
+            add("classpath", "org.apache.httpcomponents:httpclient:${libs.versions.httpclient.get()}")
+                .because("Security floor: httpclient ${libs.versions.httpclient.get()} (CVE-2020-13956)")
+            add("classpath", "org.ow2.asm:asm:${libs.versions.asm.get()}")
+                .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+            add("classpath", "org.ow2.asm:asm-tree:${libs.versions.asm.get()}")
+                .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+            add("classpath", "org.ow2.asm:asm-commons:${libs.versions.asm.get()}")
+                .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+            add("classpath", "org.ow2.asm:asm-analysis:${libs.versions.asm.get()}")
+                .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+            add("classpath", "org.ow2.asm:asm-util:${libs.versions.asm.get()}")
+                .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+        }
+    }
+}
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose.compiler)
     alias(libs.plugins.ksp)
     alias(libs.plugins.serialization)
+}
+
+// App/test/lint-check graphs: guava resolves the -android flavor (Media3
+// requests 33.3.1-android, and kotlinx-coroutines-guava's -jre request
+// joins the same graphs, where conflict resolution picks one highest
+// version - the floor keeps every graph on the patched release). The
+// declarable parents below cover their variant classpaths through
+// configuration inheritance.
+dependencies {
+    constraints {
+        add("implementation", "com.google.guava:guava:${libs.versions.guava.get()}-android")
+            .because("Security floor: guava ${libs.versions.guava.get()}-android (CVE-2026-102554)")
+        add("androidTestImplementation", "com.google.guava:guava:${libs.versions.guava.get()}-android")
+            .because("Security floor: guava ${libs.versions.guava.get()}-android (CVE-2026-102554)")
+        add("lintChecks", "com.google.guava:guava:${libs.versions.guava.get()}-android")
+            .because("Security floor: guava ${libs.versions.guava.get()}-android (CVE-2026-102554)")
+    }
+}
+
+// Configurations created by AGP/KSP plugins that cannot be reached from the
+// dependencies block are floored as they appear. The matcher is broad
+// (`*Classpath` + androidLintTool) so every tooling graph carries the ASM
+// family floors, but guava's -jre flavor is applied ONLY to the JVM tooling
+// graphs (lint tool + KSP processor paths): the app variant classpaths
+// (debugRuntimeClasspath, debugLintChecksClasspath, ...) also match
+// `*Classpath`, and flooring them with -jre would collide with the -android
+// flavor their graphs resolve by design (see the constraints block above).
+// androidLintTool additionally carries the BouncyCastle, commons-lang3 and
+// httpclient pins.
+val pbSecurityFloors = dependencies.constraints
+configurations.matching {
+    it.name == "androidLintTool" ||
+        it.name.endsWith("Classpath")
+}.configureEach {
+    if (name == "androidLintTool" ||
+        name.endsWith("kspClasspath") ||
+        name.endsWith("KotlinProcessorClasspath")
+    ) {
+        pbSecurityFloors.add(name, "com.google.guava:guava:${libs.versions.guava.get()}-jre")
+            .because("Security floor: guava ${libs.versions.guava.get()}-jre (CVE-2026-102554)")
+    }
+    pbSecurityFloors.add(name, "org.ow2.asm:asm:${libs.versions.asm.get()}")
+        .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+    pbSecurityFloors.add(name, "org.ow2.asm:asm-tree:${libs.versions.asm.get()}")
+        .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+    pbSecurityFloors.add(name, "org.ow2.asm:asm-commons:${libs.versions.asm.get()}")
+        .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+    pbSecurityFloors.add(name, "org.ow2.asm:asm-analysis:${libs.versions.asm.get()}")
+        .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+    pbSecurityFloors.add(name, "org.ow2.asm:asm-util:${libs.versions.asm.get()}")
+        .because("Security floor: ASM family ${libs.versions.asm.get()} (SNYK-JAVA-ORGOW2ASM-21715439, SNYK-JAVA-ORGOW2ASM-21715442, SNYK-JAVA-ORGOW2ASM-21715445, SNYK-JAVA-ORGOW2ASM-21715448, SNYK-JAVA-ORGOW2ASM-21715452)")
+    if (name == "androidLintTool") {
+        pbSecurityFloors.add(name, "org.bouncycastle:bcprov-jdk18on:${libs.versions.bouncycastle.get()}")
+            .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+        pbSecurityFloors.add(name, "org.bouncycastle:bcpkix-jdk18on:${libs.versions.bouncycastle.get()}")
+            .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+        pbSecurityFloors.add(name, "org.bouncycastle:bcutil-jdk18on:${libs.versions.bouncycastle.get()}")
+            .because("Security floor: BouncyCastle jdk18on family ${libs.versions.bouncycastle.get()} (CVE-2026-8763, CVE-2026-13506, CVE-2026-5588)")
+        pbSecurityFloors.add(name, "org.apache.commons:commons-lang3:${libs.versions.commonsLang3.get()}")
+            .because("Security floor: commons-lang3 ${libs.versions.commonsLang3.get()} (CVE-2025-48924)")
+        pbSecurityFloors.add(name, "org.apache.httpcomponents:httpclient:${libs.versions.httpclient.get()}")
+            .because("Security floor: httpclient ${libs.versions.httpclient.get()} (CVE-2020-13956)")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +227,12 @@ if (providers.environmentVariable("CI").orNull == "true" && pbReleaseArtifactReq
 
 android {
     namespace = "com.pahebatcher.app"
-    compileSdk = 37
+    // Compose BOM 2026.11.01 (Compose 1.13) AAR metadata requires compiling
+    // against API 37.1; the minor API level is expressed through the AGP 9
+    // compileSdk DSL (android-37.1 platform installed in the SDK).
+    compileSdk {
+        version = release(37) { minorApiLevel = 1 }
+    }
 
     defaultConfig {
         applicationId = "com.pahebatcher.app"
@@ -227,7 +345,7 @@ dependencies {
     // PlayArrow/ArrowBack) — version pinned by the already-verified Compose BOM, NOT
     // material-icons-extended (rejected per §9/§32). material3 1.4.0 no longer exposes
     // the icons package transitively, so the ~dozen core glyphs are declared here.
-    implementation("androidx.compose.material:material-icons-core")
+    implementation(libs.androidx.compose.material.icons.core)
 
     // Room
     implementation(libs.androidx.room.runtime)

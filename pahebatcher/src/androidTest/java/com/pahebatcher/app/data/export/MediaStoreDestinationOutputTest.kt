@@ -4,6 +4,7 @@ import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
+import android.os.Bundle
 import android.provider.MediaStore
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -85,11 +86,27 @@ class MediaStoreDestinationOutputTest {
         // Episode rows go with the session (FK cascade); visible rows + local
         // fixtures are ours and removed by token/path.
         runBlocking { database.downloadSessionDao().delete(session.sessionId) }
-        for (row in rowsInDir()) {
-            if (row.displayName.contains(token)) {
-                contentResolver.delete(row.uri, null, null)
-            }
+        // One parameterized delete instead of a per-row delete(uri, null, null):
+        // the selection string is built only from constants, and the token
+        // (test-generated, alphanumeric - no LIKE metacharacters) travels purely
+        // as a bound argument. No row data read from the database flows into the
+        // delete call, so there is no string that could be interpreted as SQL.
+        val args = Bundle().apply {
+            putString(
+                ContentResolver.QUERY_ARG_SQL_SELECTION,
+                "${MediaStore.MediaColumns.RELATIVE_PATH}=? AND " +
+                    "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
+            )
+            putStringArray(
+                ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
+                arrayOf(relativePath(), "%$token%"),
+            )
+            // Pending fixtures are ours too (Bundle form matches them; the legacy
+            // selection overload silently excludes IS_PENDING=1 - see
+            // MediaStoreExportTest.queryRows).
+            putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
         }
+        contentResolver.delete(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, args)
         for (file in localFiles) {
             file.setReadable(true, false)
             file.delete()
@@ -147,29 +164,6 @@ class MediaStoreDestinationOutputTest {
     }
 
     private fun relativePath() = OutputPathNames.mediaStoreRelativePath(session.title, session.sessionId)
-
-    private data class Row(val uri: Uri, val displayName: String)
-
-    private fun rowsInDir(): List<Row> {
-        val out = mutableListOf<Row>()
-        contentResolver.query(
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-            arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME),
-            "${MediaStore.MediaColumns.RELATIVE_PATH}=?",
-            arrayOf(relativePath()),
-            null,
-        )?.use { c ->
-            val idIdx = c.getColumnIndex(MediaStore.MediaColumns._ID)
-            val nameIdx = c.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
-            while (c.moveToNext()) {
-                out += Row(
-                    Uri.withAppendedPath(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, c.getString(idIdx)),
-                    c.getString(nameIdx),
-                )
-            }
-        }
-        return out
-    }
 
     private fun probe(title: String, audio: String = "jpn") = runBlocking {
         exporter.destinationOutput(

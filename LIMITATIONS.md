@@ -3540,3 +3540,272 @@ playback mode.**
     waited, and the dialog appeared when the user returned to Downloads - tab position
     preserved, prompt timing disconnected from the tap. **Adopted alternative B
     supersedes the defer behavior; the test above was updated accordingly.**
+
+## 54. Build simplification / dependency security round (DECISIONS 167, 2026-11-25) - platform gaps and accepted residuals
+
+> **Amended 2026-11-27 (DECISIONS 168):** lockfiles, `gradle/verification-metadata.xml`
+> and `.github/dependabot.yml` were removed in the dependency-management
+> simplification round. Entries 54.1, 54.3 and 54.7 are updated below; the rest
+> is unchanged.
+>
+> **Amended 2026-11-27/28 (DECISIONS 170, toolchain/library update round):** 54.4
+> updated (ASM floored at 9.11.1 and graph-verified; Snyk re-scan caveat added),
+> new entries 54.8 (Material3 1.5.0 `Slider` overload deprecation) and 54.9
+> (one-off native Scudo/libhwui abort in one of three device runs).
+
+### 54.1 [REMOVED 2026-11-27, DECISIONS 168] Dependabot could not update verification checksums
+
+- Formerly: dependabot-core#1996 - Dependabot does not write
+  `gradle/verification-metadata.xml`, so merged Gradle PRs needed a local
+  `--write-verification-metadata sha256 --write-locks` regeneration.
+- **Why removed:** the whole lockfile + verification-metadata layer this
+  limitation described was deleted in DECISIONS 168 (all of it was introduced
+  by this PR; base `629bcea` had none of it), together with
+  `.github/dependabot.yml`. There is no checksum file to regenerate and no
+  regeneration command to document. The security floors remain enforced as
+  ordinary Gradle constraints on every build. Upstream issue dependabot-core#1996
+  still exists but no longer affects this repository.
+
+### 54.2 Three inherent Snyk Code findings remain (19 -> 3; 0 suppressed)
+
+- **Finding 1 (MEDIUM): `Aes128Decryptor.kt` AES-128-CBC without integrity.**
+  RFC 8216 §5.2 mandates AES-128-CBC for `EXT-X-KEY:METHOD=AES-128`; HLS defines no
+  AEAD mode for this method, so switching to GCM would break playback of every
+  encrypted stream the app exists to download. The call site uses `NoPadding`
+  (no `BadPaddingException` oracle), input is validated before init, ciphertext
+  arrives over HTTPS, and failures are never reflected to a network peer. The KDoc
+  now carries this rationale inline. Protocol-mandated false positive - NOT
+  suppressed, documented in the source and here.
+- **Finding 2 (MEDIUM/LOW): shared test helper `HlsTestCipher.kt` CBC encryption.**
+  The test suite must produce CBC ciphertext to exercise the CBC decryptor (there is
+  no other valid input). The remediation consolidated the previously scattered
+  per-test CBC instances into exactly ONE documented use site instead of eight.
+  Test-only, no production exposure.
+- **Finding 3 (LOW): `WebViewJsonExtractionTest.kt` JavaScript enabled.**
+  The test drives the production `evaluateJavascript` capture scripts; disabling JS
+  would make the test vacuous. Test-only WebView loading first-party fixtures.
+- **Affected Features:** none at runtime; all three are analyzer categories that
+  cannot be cleared without breaking protocol conformance or test fidelity.
+- **Risk Level:** Low (finding 1 is protocol-mandated with mitigating call-site
+  properties; 2 and 3 are test-source only).
+
+### 54.3 Dependabot diagnosis was validated locally, not by a GitHub-hosted rerun
+
+- **Limitation:** the detailed updater log for failed run 45431153460
+  (`/network/updates/1728130935`) requires repository write access (403/404
+  unauthenticated; no `gh` CLI/token available in this environment), and the task
+  rules forbid pushing or changing GitHub settings to trigger a fresh security
+  update. The root-cause conclusion (DECISIONS 167.7) therefore rests on
+  repository-side hard evidence (manifest scans at the failing SHAs, API job
+  metadata, dependabot-core issue classes), not on the updater's own log.
+- **Status after DECISIONS 168:** `.github/dependabot.yml` was removed, so there
+  is no configured Dependabot run to re-trigger or verify - the failed-run
+  diagnosis is now historical context for why no such configuration is kept.
+  What remains live is the local half of the old claim: the version catalog plus
+  the Gradle security-floor constraints resolve into a complete, patched
+  dependency graph (`dependencies`/`buildEnvironment` reports show all eight
+  remediated versions on every graph). That establishes local enforcement only;
+  it says nothing about GitHub's updater, which this repository no longer
+  configures.
+- **Risk Level:** Low (process/verification gap on a historical diagnosis, not
+  code risk).
+
+### 54.4 [REMEDIATED AT GRAPH LEVEL 2026-11-27, DECISIONS 169/170] Snyk OS findings: 5 x `org.ow2.asm`
+
+- **Original limitation:** after remediation `snyk test --all-projects` reported 5 MEDIUM
+  issues, all `org.ow2.asm:asm` 9.9/9.9.1 (`Inefficient Algorithmic Complexity`,
+  `Memory Allocation with Excessive Size Value`, `Uncontrolled Recursion`) reached
+  only through AGP/lint/KSP tooling classpaths (`androidLintTool`, `lint-api`,
+  `asm-commons`, `lint-typedef-remover`).
+- **Provenance:** the advisory IDs
+  (`SNYK-JAVA-ORGOW2ASM-21715439/442/445/448/452`) appear identically in the
+  pre-change baseline scan; zero findings were introduced by the rounds that
+  predate the ASM floor.
+- **Status:** the ASM family is now floored at `9.11.1` (catalog `asm`,
+  DECISIONS 169) on the buildscript `classpath`, on `androidLintTool` and on
+  every `*Classpath` tooling configuration. Dependency-graph verification in
+  DECISIONS 170 shows every natural request (`9.9`, `9.9.1`, `8.0.1`) resolved
+  to `9.11.1` on each graph where ASM appears (`classpath`, `androidLintTool`,
+  `composeMappingProducerClasspath`), with assemble, lint, KSP and both unit
+  test variants green under the floor - so the "why not pinned away" rationale
+  previously recorded here (toolchain breakage risk) did not materialize.
+- **Caveat:** a confirming `snyk test` re-scan was NOT run in the 2026-11-27
+  update round (the Snyk CLI is installed but not authenticated on this
+  machine); the remediation claim rests on the resolved dependency graph and a
+  green toolchain, not on a fresh Snyk report.
+- **Risk Level:** Low (compile/lint toolchain only; not shipped in the APK).
+
+### 54.5 Instrumented full-suite run depends on device unlock state
+
+- **Limitation:** Activity-launching Compose tests fail wholesale with
+  "No compose hierarchies found" when the physical device is on its secure
+  lockscreen/notification shade (adb cannot bypass the Nothing OS secure lock).
+  This is an environmental precondition, not a code defect: 214 of 236 failures in
+  one run were exactly this class.
+- **Workaround:** device unlocked + `stay_on_while_plugged_in=3` before
+  `connectedDebugAndroidTest`; results are only meaningful with
+  `mCurrentFocus` on the launcher/app and `showing=false`.
+- **Risk Level:** Low (test-environment only; recorded so future runs are
+  interpreted correctly).
+
+### 54.6 Full instrumented suite after this round: 663 tests / 6 failures, none in scope
+
+- **Result:** `connectedDebugAndroidTest` on device `433aaa40` (AIN065, Android 16),
+  run with the device unlocked: **663 tests, 6 failures, 0 errors**. Classification:
+  - **2 x live-network** (`Phase17DeviceStreamingVerificationTest`,
+    `Phase17StreamingSiblingNavigationDeviceTest`) - both fail at STEP 1 with
+    "search must return at least one title (got 0)", i.e. the external backend/Cloudflare
+    refused the search. This is the long-documented external-dependency class, not code.
+  - **3 x `FirstEnqueuePromptTest.a_denied_*`** - `AssumptionViolatedException`, the
+    test's own honest `Assume.assumeFalse("baseline is GRANTED ...")` skip. Documented
+    TEST/ENVIRONMENTAL precondition (LIMITATIONS 42.2): the denied-flow cases require a
+    fresh install with `POST_NOTIFICATIONS` not yet granted, which a non-fresh install
+    does not provide.
+  - **1 x `AnimeDetailsScreenTest.thePagerStaysAccessibleAtDoubleFontScale`** -
+    `assertIsDisplayed` fails on `anime_details_page_number_12` (the LAST page button)
+    at `fontScale = 2f`, while the preceding `page_number_2` assertion passes. **Not
+    attributable to this round**, on static evidence:
+    1. `AnimeDetailsScreen.kt`, `AnimeDetailsScreenTest.kt` and `EpisodePaging.kt` are
+       byte-identical to HEAD (`git diff HEAD` empty); this round touches no `ui/` file.
+    2. The runtime classpath differs from baseline ONLY by guava
+       (`33.3.1-android -> 33.7.2-android`) and its transitives - Compose BOM
+       `2026.08.00`, Material3 `1.4.0` and every other UI library are unchanged.
+    3. The failure is a borderline layout-width computation:
+       `pageNumberButtonBudget` -> `pageNumberWindow` -> a `.horizontalScroll` strip
+       where the rightmost button scrolls out of the slot, so it depends purely on the
+       device's dp width, `ButtonDefaults.MinWidth` and Material3 typography.
+    4. This exact branch is already documented as device-width sensitive: on the
+       "~461dp window, ~271dp numbers slot" device it never fits more than ~4 buttons
+       (LIMITATIONS:3294-3296, DECISIONS:7298/7304). The current device computes a
+       **411dp window / ~221dp slot** (1080px / 420dpi), i.e. ~50dp narrower than the
+       documented device, while device display state is stock (`font_scale=1.0`, no
+       `wm size`/`wm density`/`display_size_forced` overrides).
+    - **Baseline execution — COMPLETED, caveat closed.** The confirming run against
+      baseline HEAD `629bcea` in a clean worktree was executed at both widths (it had
+      previously been cancelled by an environment restart; this time it completed,
+      74 tasks, BUILD SUCCESSFUL / failed-as-expected per cell):
+
+      | | @411dp (physical density 420) | @461dp (override density 375) |
+      |---|---|---|
+      | **baseline HEAD `629bcea`** | **FAIL** (`failures="1"`) | **PASS** (`failures="0"`) |
+      | **this round's working tree** | **FAIL** (`failures="1"`) | **PASS** (`failures="0"`) |
+
+      Behaviour is **identical to baseline at both widths**: baseline reproduces the
+      failure at 411dp exactly as this round's tree does, and both pass once the device
+      is set to the documented ~461dp window (density 375 -> 460.8dp, which also restores
+      the documented ~271dp numbers slot). The failure is therefore **pre-existing at HEAD
+      and purely device-width dependent**, not a regression from this round. The static
+      evidence in points 1-4 above and this execution agree.
+    - **Test-environment note:** reproducing the documented window requires
+      `adb shell wm density 375` (the current device's physical density is 420 -> 411dp,
+      ~50dp narrower than the ~461dp device the docs were written against). Device state
+      was restored afterwards (`wm density reset` -> physical 420, `font_scale` 1.0), and
+      the temporary baseline worktree was removed.
+- **Risk Level:** Low (2 external, 3 documented test-environment preconditions, 1
+  device-width-sensitive UI case outside this round's scope).
+
+### 54.7 Dependabot security updates for the pinned Gradle transitive dependencies are NOT established - manual remediation is required
+
+- **Limitation:** there is no automated security-update path for the eight
+  pinned transitive dependencies (guava, commons-lang3, httpclient, jose4j,
+  bcpkix-jdk18on, bcprov-jdk18on, bcutil-jdk18on, jdom2), and there is no
+  evidence that GitHub's Gradle security-update machinery can provide one.
+  Official GitHub documentation ("About Dependabot security updates") states:
+    1. "security updates are triggered only for dependencies that are
+       specified in a manifest or lock file"; and
+    2. for ecosystems other than npm (and NuGet `PackageReference`),
+       "Dependabot can't update an indirect or transitive dependency if doing
+       so would also require updating the parent dependency."
+  These eight exist only as AGP/lint/KSP/Media3 tooling transitives; fixing a
+  future advisory would require changing the parent dependency (AGP/KSP) or
+  adding direct pins - Dependabot does not add direct pins for Gradle (that
+  behavior is documented only for NuGet), and adding artificial direct
+  dependencies to the application graph was explicitly ruled out by the
+  review. The one observed security-update run (45431153460) failed with
+  "no files changed" (DECISIONS 167.7), and no successful GitHub-hosted
+  security-update run has been observed for these artifacts.
+- **Current configuration (after DECISIONS 168):** `.github/dependabot.yml`
+  was removed along with the lockfiles and verification metadata - the
+  configuration existed only to work around the updater's limitations and to
+  document the lock/checksum regeneration flow, both of which are gone. So the
+  repository now has NO Dependabot configuration at all: no scheduled version
+  PRs and no security-update PRs for any dependency. The mechanisms are:
+  (a) *remediation now* = Gradle dependency floors (catalog versions +
+  `constraints { ... }` with `because(...)` reasons in
+  `pahebatcher/build.gradle.kts`), enforced on every local and CI build
+  regardless of any bot; (b) *Dependabot version updates* = none configured -
+  version bumps for declared dependencies are a manual, owner-driven change
+  (bump the catalog, run the battery, commit); (c) *Dependabot security
+  updates* = not established for these transitive dependencies (above), and no
+  longer configured for direct ones either. Repository Dependabot alerts (the
+  read-only advisory notifications) are a GitHub-side feature of the dependency
+  graph and are unaffected by removing the configuration file.
+- **Actual maintenance/remediation process required for the eight pins:**
+    1. Monitor advisories: repository Dependabot alerts (alerts still fire for
+       every vulnerable dependency in the graph even when no update PR can be
+       opened), `snyk test`, and the GitHub Advisory Database.
+    2. When a fixed version exists, bump the pin in `gradle/libs.versions.toml`
+       (floors are MINIMUM versions - a newer request from the toolchain
+       already passes through unchanged, so a bump only raises the floor).
+    3. Run the build/test battery
+       (`assembleDebug/assembleRelease/bundleRelease/testDebugUnitTest/
+       testReleaseUnitTest/lintDebug/assembleDebugAndroidTest`), then commit
+       the catalog and the constraint block if its comment text changed.
+    4. There are no lockfiles or checksum files to regenerate (DECISIONS 168).
+- **Affected features:** automated security patching of the pinned transitive
+  dependencies (manual instead); Dependabot PR flows of any kind (none
+  configured). Everything else about the pipeline (local floor enforcement,
+  build/test gates, release workflow) is unaffected.
+- **Risk Level:** Medium (the eight reported vulnerabilities are currently
+  remediated and re-verified, and alerting still works, but a future advisory
+  on one of these artifacts - or on any direct dependency - requires a manual
+  version bump within the owner's response time rather than an automated PR).
+
+### 54.8 Material3 1.5.0 deprecates the stateless `Slider` overload used at two call sites (2026-11-27, DECISIONS 170)
+
+- **Limitation:** the Compose BOM 2026.11.01 upgrade (Material3 1.5.0) deprecates
+  the `Slider(value, onValueChange, ...)` stateless overload in favour of the
+  `SliderState`-based one. Two production call sites use it and now emit compiler
+  deprecation warnings: `PlayerScreen.kt:324` and `SettingsScreen.kt:824`. Both
+  already pass `onValueChange`, so runtime behavior is unchanged and compilation
+  is unaffected - deprecated, not removed.
+- **Why not migrated in this round:** the round is a dependency update; rewriting
+  the gesture/`SliderState` flow is a source refactor with its own verification
+  burden (seek-drag tests exist: `PlayerSeekSliderDragTest` 4/4) and no functional
+  gain. The migration should be done as a small dedicated change before the
+  overload is ever removed upstream.
+- **Risk Level:** Low (warnings only; behavior verified green in the full battery
+  and on device after the BOM bump).
+
+### 54.9 One-off native Scudo/libhwui abort killed one of three full device runs (2026-11-28, DECISIONS 170)
+
+- **Event:** of three consecutive `connectedDebugAndroidTest` runs of the SAME
+  final debug APK on device `433aaa40`, run 2 aborted mid-suite (563 tests / 82
+  classes recorded, `android-test.testRunFailed` - "Process crashed") with a
+  native tombstone: `Scudo ERROR: corrupted chunk header ... might indicate
+  memory corruption or a double free`, `Fatal signal 6 (SIGABRT)` in the app's
+  `ReferenceQueueD` thread, backtrace through `libhwui.so
+  (RenderNode::~RenderNode)` invoked from `NativeAllocationRegistry$CleanerThunk`
+  (GC cleanup of a system render node) - i.e. heap corruption DETECTED at free
+  time inside the system rendering library, not an app Java/Kotlin fault.
+- **Evidence it is not an upgrade regression:** runs 1 and 3 of the identical
+  APK completed the full suite green-aside-from-the-known-cases with byte-equal
+  results (**663 tests / 106 classes / 1 failure / 0 errors / 3 skipped** each);
+  the failure/skip set is exactly the documented §54.6 pager case + the three
+  FirstEnqueue assumption skips. The crash signature appears NOWHERE in the
+  repository's archived evidence; the device's only other tombstone
+  (`tombstone_00`, 2026-10-28) is an unrelated system `media.swcodec` vp8
+  encoder abort. No memory pressure (5.9 GB available), no thermal issue (30
+  C), device awake with focus on launcher for all runs.
+- **Reproducibility:** 1 of 3; did not recur in the confirming run; no new
+  tombstone after run 3. Non-deterministic native event (a corrupted header can
+  be written long before it is detected).
+- **Why not investigated further:** the abort is in AOSP `libhwui` code paths,
+  the trigger is unreproducible on demand, and the app's own test/production
+  code paths ran green twice in full immediately before and after. Recorded so a
+  recurrence is recognized (same signature = this entry, not a new panic) and
+  re-opened only if it starts reproducing.
+- **Risk Level:** Low (one-off native system-library event; full-suite results
+  confirmed by two clean runs of the same APK).
+
+[Back to Index](README.md)

@@ -120,11 +120,31 @@ class MediaStoreExportTest {
     @After
     fun teardown() {
         if (tokens.isNotEmpty()) {
-            for (row in rowsInMoviesTree()) {
-                if (tokens.any { row.name.contains(it) }) {
-                    contentResolver.delete(row.uri, null, null)
-                }
+            // Parameterized delete with the exact scope of rowsInMoviesTree()
+            // (Movies/ tree + our owner package), narrowed to names containing any
+            // test token. The selection string is constants only; the tokens
+            // (test-generated, alphanumeric - no LIKE metacharacters) travel as
+            // bound arguments, so no value read from the database is ever
+            // interpreted as SQL. Bundle form with MATCH_INCLUDE keeps pending
+            // crash-residue rows deletable, matching the query it replaces.
+            val nameClauses = tokens.joinToString(" OR ") {
+                "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?"
             }
+            val args = Bundle().apply {
+                putString(
+                    ContentResolver.QUERY_ARG_SQL_SELECTION,
+                    "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? " +
+                        "AND ${MediaStore.MediaColumns.OWNER_PACKAGE_NAME} = ? " +
+                        "AND ($nameClauses)",
+                )
+                putStringArray(
+                    ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
+                    arrayOf(OutputPathNames.MOVIES_PREFIX + "%", BuildConfig.APPLICATION_ID) +
+                        tokens.map { "%$it%" }.toTypedArray(),
+                )
+                putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+            }
+            contentResolver.delete(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, args)
         }
         for (file in localFiles) {
             file.setReadable(true, false)

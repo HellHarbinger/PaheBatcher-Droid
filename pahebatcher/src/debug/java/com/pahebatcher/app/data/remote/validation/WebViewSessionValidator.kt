@@ -109,7 +109,13 @@ class WebViewSessionValidator(private val context: Context) {
                     ) {
                         AppLog.w(TAG, "SSL Error: ${error?.toString()}")
                         diagnostics.add("SSL Error: ${error?.toString()}")
-                        handler?.proceed() // Allow for validation - NOT for production
+                        // Reject the load instead of proceeding. This validator only
+                        // talks to the real animepahe.com/animepahe.pw endpoints, which
+                        // present valid certificates; a failure here is a genuine TLS
+                        // problem that must surface in diagnostics rather than be
+                        // silently bypassed. (Debug-only spike, but it still must not
+                        // disable certificate validation.)
+                        handler?.cancel()
                     }
 
                     override fun shouldInterceptRequest(
